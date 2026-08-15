@@ -1,0 +1,690 @@
+package native
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+)
+
+// ELF constants
+const (
+	ELF_MAGIC = "\x7fELF"
+	ELFCLASS32 = 1
+	ELFCLASS64 = 2
+	ELFDATA2LSB = 1
+	ELFDATA2MSB = 2
+	ET_EXEC = 2
+	ET_DYN = 3
+	EM_ARM = 40
+	EM_AARCH64 = 183
+	EM_386 = 3
+	EM_X86_64 = 62
+	SHT_PROGBITS = 1
+	SHT_SYMTAB = 2
+	SHT_DYNSYM = 11
+	SHT_RELA = 4
+	STT_FUNC = 2
+)
+
+// ELF file structures
+type ELFHeader struct {
+	Magic     [4]byte
+	Class     uint8
+	Data      uint8
+	Version   uint8
+	OSABI     uint8
+	Padding   [8]byte
+	Type      uint16
+	Machine   uint16
+	Version2  uint32
+	Entry     uint64
+	PhOff     uint64
+	ShOff     uint64
+	Flags     uint32
+	EhSize    uint16
+	PhEntSize uint16
+	PhNum     uint16
+	ShEntSize uint16
+	ShNum     uint16
+	ShStrNdx  uint16
+}
+
+type SectionHeader struct {
+	Name      uint32
+	Type      uint32
+	Flags     uint64
+	Addr      uint64
+	Offset    uint64
+	Size      uint64
+	Link      uint32
+	Info      uint32
+	AddrAlign uint64
+	EntSize   uint64
+}
+
+type SymbolEntry struct {
+	Name  uint32
+	Info  uint8
+	Other uint8
+	Shndx uint16
+	Value uint64
+	Size  uint64
+}
+
+// ELFParser parses ELF files
+type ELFParser struct {
+	File     *os.File
+	Data     []byte
+	Header   ELFHeader
+	Sections []SectionHeader
+	Symbols  []SymbolEntry
+	Arch     int
+	Mode     int
+	Bits     int
+	IsEndian bool // true = little endian
+	// SymStrTabNdx is the section index of the string table holding
+	// symbol NAMES (as opposed to Header.ShStrNdx, which is the
+	// string table for SECTION names - a different table entirely).
+	// Captured from the symbol table section's own sh_link field when
+	// parseSymbols runs, since that's the only correct way to find it
+	// (there's no fixed/well-known index for it the way section names
+	// always live at Header.ShStrNdx).
+	SymStrTabNdx uint16
+}
+
+// NewELFParser creates a new ELF parser
+func NewELFParser(path string) (*ELFParser, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+
+	if len(data) < 16 {
+		return nil, fmt.Errorf("file too small for ELF header")
+	}
+
+	if string(data[:4]) != ELF_MAGIC {
+		return nil, fmt.Errorf("not an ELF file")
+	}
+
+	p := &ELFParser{
+		Data: data,
+	}
+
+	if err := p.parseHeader(); err != nil {
+		return nil, err
+	}
+
+	if err := p.parseSections(); err != nil {
+		return nil, err
+	}
+
+	if err := p.parseSymbols(); err != nil {
+		// Symbols are optional
+		fmt.Fprintf(os.Stderr, "warning: could not parse symbols: %v\n", err)
+	}
+
+	return p, nil
+}
+
+func (p *ELFParser) parseHeader() error {
+	if len(p.Data) < 64 {
+		return fmt.Errorf("ELF header too small")
+	}
+
+	p.Header.Class = p.Data[4]
+	p.Header.Data = p.Data[5]
+
+	// Determine endianness
+	littleEndian := p.Header.Data == ELFDATA2LSB
+	p.IsEndian = littleEndian
+
+	var readUint32 func([]byte) uint32
+	var readUint64 func([]byte) uint64
+
+	if littleEndian {
+		readUint32 = binary.LittleEndian.Uint32
+		readUint64 = binary.LittleEndian.Uint64
+	} else {
+		readUint32 = binary.BigEndian.Uint32
+		readUint64 = binary.BigEndian.Uint64
+	}
+
+	p.Header.Type = binary.LittleEndian.Uint16(p.Data[16:18])
+	p.Header.Machine = binary.LittleEndian.Uint16(p.Data[18:20])
+	p.Header.Version2 = readUint32(p.Data[20:24])
+
+	if p.Header.Class == ELFCLASS64 {
+		p.Header.Entry = readUint64(p.Data[24:32])
+		p.Header.PhOff = readUint64(p.Data[32:40])
+		p.Header.ShOff = readUint64(p.Data[40:48])
+		p.Header.Flags = readUint32(p.Data[48:52])
+		p.Header.EhSize = binary.LittleEndian.Uint16(p.Data[52:54])
+		p.Header.PhEntSize = binary.LittleEndian.Uint16(p.Data[54:56])
+		p.Header.PhNum = binary.LittleEndian.Uint16(p.Data[56:58])
+		p.Header.ShEntSize = binary.LittleEndian.Uint16(p.Data[58:60])
+		p.Header.ShNum = binary.LittleEndian.Uint16(p.Data[60:62])
+		p.Header.ShStrNdx = binary.LittleEndian.Uint16(p.Data[62:64])
+		p.Bits = 64
+	} else {
+		p.Header.Entry = uint64(readUint32(p.Data[24:28]))
+		p.Header.PhOff = uint64(readUint32(p.Data[28:32]))
+		p.Header.ShOff = uint64(readUint32(p.Data[32:36]))
+		p.Header.Flags = readUint32(p.Data[36:40])
+		p.Header.EhSize = binary.LittleEndian.Uint16(p.Data[40:42])
+		p.Header.PhEntSize = binary.LittleEndian.Uint16(p.Data[42:44])
+		p.Header.PhNum = binary.LittleEndian.Uint16(p.Data[44:46])
+		p.Header.ShEntSize = binary.LittleEndian.Uint16(p.Data[46:48])
+		p.Header.ShNum = binary.LittleEndian.Uint16(p.Data[48:50])
+		p.Header.ShStrNdx = binary.LittleEndian.Uint16(p.Data[50:52])
+		p.Bits = 32
+	}
+
+	// Set architecture
+	switch p.Header.Machine {
+	case EM_AARCH64:
+		p.Arch = ArchARM64
+		p.Mode = ModeARM64 | ModeLITTLE_ENDIAN
+	case EM_ARM:
+		p.Arch = ArchARM
+		p.Mode = ModeARM | ModeLITTLE_ENDIAN
+	case EM_386:
+		p.Arch = ArchX86
+		p.Mode = Mode32
+	case EM_X86_64:
+		p.Arch = ArchX86
+		p.Mode = Mode64
+	default:
+		return fmt.Errorf("unsupported architecture: %d", p.Header.Machine)
+	}
+
+	return nil
+}
+
+func (p *ELFParser) parseSections() error {
+	if p.Header.ShOff == 0 || p.Header.ShNum == 0 {
+		return nil
+	}
+
+	var readUint32 func([]byte) uint32
+	var readUint64 func([]byte) uint64
+
+	if p.IsEndian {
+		readUint32 = binary.LittleEndian.Uint32
+		readUint64 = binary.LittleEndian.Uint64
+	} else {
+		readUint32 = binary.BigEndian.Uint32
+		readUint64 = binary.BigEndian.Uint64
+	}
+
+	p.Sections = make([]SectionHeader, p.Header.ShNum)
+	offset := p.Header.ShOff
+
+	for i := 0; i < int(p.Header.ShNum); i++ {
+		if offset+uint64(p.Header.ShEntSize) > uint64(len(p.Data)) {
+			break
+		}
+
+		data := p.Data[offset:]
+		s := SectionHeader{}
+
+		if p.Header.Class == ELFCLASS64 {
+			s.Name = readUint32(data[0:4])
+			s.Type = readUint32(data[4:8])
+			s.Flags = readUint64(data[8:16])
+			s.Addr = readUint64(data[16:24])
+			s.Offset = readUint64(data[24:32])
+			s.Size = readUint64(data[32:40])
+			s.Link = readUint32(data[40:44])
+			s.Info = readUint32(data[44:48])
+			s.AddrAlign = readUint64(data[48:56])
+			s.EntSize = readUint64(data[56:64])
+		} else {
+			s.Name = readUint32(data[0:4])
+			s.Type = readUint32(data[4:8])
+			s.Flags = uint64(readUint32(data[8:12]))
+			s.Addr = uint64(readUint32(data[12:16]))
+			s.Offset = uint64(readUint32(data[16:20]))
+			s.Size = uint64(readUint32(data[20:24]))
+			s.Link = readUint32(data[24:28])
+			s.Info = readUint32(data[28:32])
+			s.AddrAlign = uint64(readUint32(data[32:36]))
+			s.EntSize = uint64(readUint32(data[36:40]))
+		}
+
+		p.Sections[i] = s
+		offset += uint64(p.Header.ShEntSize)
+	}
+
+	return nil
+}
+
+func (p *ELFParser) parseSymbols() error {
+	for _, s := range p.Sections {
+		if s.Type == SHT_SYMTAB {
+			p.SymStrTabNdx = uint16(s.Link)
+			return p.parseSymbolTable(s)
+		}
+	}
+	return fmt.Errorf("no symbol table found")
+}
+
+func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
+	var readUint32 func([]byte) uint32
+	var readUint64 func([]byte) uint64
+
+	if p.IsEndian {
+		readUint32 = binary.LittleEndian.Uint32
+		readUint64 = binary.LittleEndian.Uint64
+	} else {
+		readUint32 = binary.BigEndian.Uint32
+		readUint64 = binary.BigEndian.Uint64
+	}
+
+	entSize := uint64(24) // Default for 64-bit
+	if p.Header.Class != ELFCLASS64 {
+		entSize = 16
+	}
+
+	if sec.EntSize > 0 {
+		entSize = sec.EntSize
+	}
+
+	count := sec.Size / entSize
+	p.Symbols = make([]SymbolEntry, 0, count)
+
+	offset := sec.Offset
+	for i := uint64(0); i < count; i++ {
+		if offset+entSize > uint64(len(p.Data)) {
+			break
+		}
+
+		data := p.Data[offset:]
+		sym := SymbolEntry{}
+
+		if p.Header.Class == ELFCLASS64 {
+			sym.Name = readUint32(data[0:4])
+			sym.Info = data[4]
+			sym.Other = data[5]
+			sym.Shndx = binary.LittleEndian.Uint16(data[6:8])
+			sym.Value = readUint64(data[8:16])
+			sym.Size = readUint64(data[16:24])
+		} else {
+			sym.Name = readUint32(data[0:4])
+			sym.Value = uint64(readUint32(data[4:8]))
+			sym.Size = uint64(readUint32(data[8:12]))
+			sym.Info = data[12]
+			sym.Other = data[13]
+			sym.Shndx = binary.LittleEndian.Uint16(data[14:16])
+		}
+
+		if sym.Info&0xf == STT_FUNC {
+			p.Symbols = append(p.Symbols, sym)
+		}
+
+		offset += entSize
+	}
+
+	return nil
+}
+
+// GetSymbolName returns the name of a symbol
+func (p *ELFParser) GetSymbolName(sym SymbolEntry) string {
+	strTabNdx := p.SymStrTabNdx
+	if strTabNdx == 0 {
+		// No .symtab was parsed (SymStrTabNdx never set) - fall back to
+		// the section-name string table, which is wrong in general but
+		// preserves this function's old behavior for callers that
+		// somehow still get a SymbolEntry without a real symbol table
+		// having been parsed.
+		strTabNdx = p.Header.ShStrNdx
+	}
+	if int(strTabNdx) >= len(p.Sections) {
+		return ""
+	}
+
+	strSec := p.Sections[strTabNdx]
+	if uint64(sym.Name)+256 > strSec.Size {
+		return ""
+	}
+
+	start := strSec.Offset + uint64(sym.Name)
+	if start >= uint64(len(p.Data)) {
+		return ""
+	}
+
+	// Read until null terminator
+	end := bytes.IndexByte(p.Data[start:], 0)
+	if end < 0 {
+		end = 256
+	}
+
+	return string(p.Data[start : start+uint64(end)])
+}
+
+// GetCodeSections returns all executable sections
+func (p *ELFParser) GetCodeSections() []CodeSection {
+	var sections []CodeSection
+
+	for _, s := range p.Sections {
+		if s.Type == SHT_PROGBITS && s.Size > 0 {
+			// Check if executable flag is set (bit 2)
+			if s.Flags&0x4 != 0 {
+				offset := s.Offset
+				if offset+s.Size > uint64(len(p.Data)) {
+					continue
+				}
+
+				code := p.Data[s.Offset : s.Offset+s.Size]
+				if len(code) == 0 {
+					continue
+				}
+
+				name := p.getSectionName(s)
+				sections = append(sections, CodeSection{
+					Name:    name,
+					Address: s.Addr,
+					Size:    s.Size,
+					Data:    code,
+					Offset:  s.Offset,
+				})
+			}
+		}
+	}
+
+	return sections
+}
+
+// getSectionName returns the name of a section
+func (p *ELFParser) getSectionName(sec SectionHeader) string {
+	if int(p.Header.ShStrNdx) >= len(p.Sections) {
+		return ""
+	}
+
+	strSec := p.Sections[p.Header.ShStrNdx]
+	start := strSec.Offset + uint64(sec.Name)
+	if start >= uint64(len(p.Data)) {
+		return ""
+	}
+
+	end := bytes.IndexByte(p.Data[start:], 0)
+	if end < 0 {
+		end = 64
+	}
+
+	return string(p.Data[start : start+uint64(end)])
+}
+
+// CodeSection represents a section containing code
+type CodeSection struct {
+	Name    string
+	Address uint64
+	Size    uint64
+	Data    []byte
+	Offset  uint64
+}
+
+// DisassembleSection disassembles a code section using Capstone
+func DisassembleSection(section CodeSection, arch, mode int) ([]Instruction, error) {
+	d, err := NewDisassembler(arch, mode)
+	if err != nil {
+		return nil, fmt.Errorf("create disassembler: %w", err)
+	}
+	defer d.Close()
+
+	return d.DisassembleAll(section.Data, section.Address)
+}
+
+// DisassembleELFFile disassembles all code sections in an ELF file
+func DisassembleELFFile(path string, w io.Writer) error {
+	parser, err := NewELFParser(path)
+	if err != nil {
+		return fmt.Errorf("parse ELF: %w", err)
+	}
+
+	sections := parser.GetCodeSections()
+	if len(sections) == 0 {
+		return fmt.Errorf("no code sections found")
+	}
+
+	fmt.Fprintf(w, "; ELF disassembly\n")
+	fmt.Fprintf(w, "; Architecture: %s\n", GetArchName(parser.Arch))
+	fmt.Fprintf(w, "; %d code sections\n\n", len(sections))
+
+	for _, sec := range sections {
+		fmt.Fprintf(w, "; ===== Section: %s @ 0x%x (%d bytes) =====\n",
+			sec.Name, sec.Address, sec.Size)
+
+		instructions, err := DisassembleSection(sec, parser.Arch, parser.Mode)
+		if err != nil {
+			fmt.Fprintf(w, "; Error disassembling: %v\n\n", err)
+			continue
+		}
+
+		for _, inst := range instructions {
+			// Try to find symbol name
+			symName := ""
+			for _, sym := range parser.Symbols {
+				if sym.Value <= inst.Address && sym.Value+sym.Size > inst.Address {
+					symName = parser.GetSymbolName(sym)
+					break
+				}
+			}
+
+			if symName != "" {
+				fmt.Fprintf(w, "\n; %s:\n", symName)
+			}
+
+			// Print instruction bytes
+			byteStr := ""
+			for _, b := range inst.Bytes {
+				byteStr += fmt.Sprintf("%02x ", b)
+			}
+			for len(byteStr) < 24 {
+				byteStr += " "
+			}
+
+			fmt.Fprintf(w, "  %08x  %s  %-8s %s\n",
+				inst.Address, byteStr, inst.Mnemonic, inst.OpStr)
+		}
+
+		fmt.Fprintln(w)
+	}
+
+	return nil
+}
+
+// RelaEntry is one Elf64_Rela relocation entry: r_offset (where the
+// relocation applies - a GOT slot's address, for the JUMP_SLOT
+// relocations PLT resolution cares about), r_info (packs the symbol
+// table index in its upper 32 bits and the relocation type in its
+// lower 32 bits), and r_addend (unused for JUMP_SLOT relocations).
+type RelaEntry struct {
+	Offset uint64
+	Info   uint64
+	Addend int64
+}
+
+// SymbolIndex returns the .dynsym index this relocation's symbol comes
+// from (the upper 32 bits of Info).
+func (r RelaEntry) SymbolIndex() uint32 {
+	return uint32(r.Info >> 32)
+}
+
+// parseDynsym parses the .dynsym section (dynamic/import symbols,
+// distinct from .symtab's locally-defined symbols) into a slice
+// indexed the same way .rela.plt's relocation entries reference it -
+// unlike parseSymbolTable (used for .symtab), this keeps every entry,
+// including the mandatory empty entry 0 and non-function symbols,
+// since RelaEntry.SymbolIndex() must be able to index directly into
+// the result.
+func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
+	var dynsymSec *SectionHeader
+	for i := range p.Sections {
+		if p.Sections[i].Type == SHT_DYNSYM {
+			dynsymSec = &p.Sections[i]
+			break
+		}
+	}
+	if dynsymSec == nil {
+		return nil, 0, fmt.Errorf("no .dynsym section found")
+	}
+
+	entSize := dynsymSec.EntSize
+	if entSize == 0 {
+		entSize = 24
+	}
+	count := dynsymSec.Size / entSize
+	syms := make([]SymbolEntry, 0, count)
+
+	offset := dynsymSec.Offset
+	for i := uint64(0); i < count; i++ {
+		if offset+entSize > uint64(len(p.Data)) {
+			break
+		}
+		data := p.Data[offset:]
+		sym := SymbolEntry{
+			Name:  binary.LittleEndian.Uint32(data[0:4]),
+			Info:  data[4],
+			Other: data[5],
+			Shndx: binary.LittleEndian.Uint16(data[6:8]),
+			Value: binary.LittleEndian.Uint64(data[8:16]),
+			Size:  binary.LittleEndian.Uint64(data[16:24]),
+		}
+		syms = append(syms, sym)
+		offset += entSize
+	}
+
+	return syms, uint16(dynsymSec.Link), nil
+}
+
+// parseRelaSection parses any SHT_RELA section (.rela.plt or .rela.dyn)
+// into its individual relocation entries.
+func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
+	entSize := sec.EntSize
+	if entSize == 0 {
+		entSize = 24
+	}
+	count := sec.Size / entSize
+	entries := make([]RelaEntry, 0, count)
+
+	offset := sec.Offset
+	for i := uint64(0); i < count; i++ {
+		if offset+entSize > uint64(len(p.Data)) {
+			break
+		}
+		data := p.Data[offset:]
+		entries = append(entries, RelaEntry{
+			Offset: binary.LittleEndian.Uint64(data[0:8]),
+			Info:   binary.LittleEndian.Uint64(data[8:16]),
+			Addend: int64(binary.LittleEndian.Uint64(data[16:24])),
+		})
+		offset += entSize
+	}
+	return entries
+}
+
+// ResolvePLT builds a map from PLT stub address to imported function
+// name (e.g. 0x18d70 -> "geteuid") by cross-referencing three pieces of
+// ELF metadata: .dynsym (import names), .rela.plt (which GOT slot each
+// import's JUMP_SLOT relocation targets), and the .plt section's own
+// machine code (disassembled to recognize each 16-byte stub's
+// "adrp x16, page; ldr x17, [x16, #off]; add x16, x16, #off; br x17"
+// pattern and read which GOT slot it jumps through).
+//
+// A caller lifting "bl <addr>" can look addr up in the returned map to
+// resolve it to the real imported function's name instead of treating
+// it as an unknown/internal call.
+func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
+	dynsyms, dynstrNdx, err := p.parseDynsym()
+	if err != nil {
+		return nil, err
+	}
+	if int(dynstrNdx) >= len(p.Sections) {
+		return nil, fmt.Errorf("invalid .dynsym string table index")
+	}
+	dynstrSec := p.Sections[dynstrNdx]
+
+	dynsymName := func(sym SymbolEntry) string {
+		start := dynstrSec.Offset + uint64(sym.Name)
+		if start >= uint64(len(p.Data)) {
+			return ""
+		}
+		end := bytes.IndexByte(p.Data[start:], 0)
+		if end < 0 {
+			return ""
+		}
+		return string(p.Data[start : start+uint64(end)])
+	}
+
+	// Map GOT slot address -> imported function name, from .rela.plt's
+	// JUMP_SLOT relocations.
+	gotToName := make(map[uint64]string)
+	for _, sec := range p.Sections {
+		if sec.Type != SHT_RELA || p.getSectionName(sec) != ".rela.plt" {
+			continue
+		}
+		for _, rel := range p.parseRelaSection(sec) {
+			idx := rel.SymbolIndex()
+			if int(idx) >= len(dynsyms) {
+				continue
+			}
+			name := dynsymName(dynsyms[idx])
+			if name != "" {
+				gotToName[rel.Offset] = name
+			}
+		}
+	}
+
+	// Disassemble .plt itself and recognize each stub's own GOT
+	// reference, mapping the stub's start address to the same name its
+	// GOT slot resolved to above.
+	var pltSec *SectionHeader
+	for i := range p.Sections {
+		if p.getSectionName(p.Sections[i]) == ".plt" {
+			pltSec = &p.Sections[i]
+			break
+		}
+	}
+	if pltSec == nil {
+		return gotToName, nil // no .plt - return what .rela.plt alone gave us (rare, but not an error)
+	}
+
+	d, err := NewARM64Disassembler()
+	if err != nil {
+		return nil, fmt.Errorf("create disassembler: %w", err)
+	}
+	defer d.Close()
+
+	pltCode := p.Data[pltSec.Offset : pltSec.Offset+pltSec.Size]
+	insns, err := d.DisassembleDetailed(pltCode, pltSec.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("disassemble .plt: %w", err)
+	}
+
+	result := make(map[uint64]string)
+	// Each stub is exactly 4 instructions (adrp, ldr, add, br) in the
+	// standard AAPCS64 PLT stub shape this project already relies on
+	// (see the ptrace PLT-stub analysis this function automates).
+	for i := 0; i+3 < len(insns); i += 4 {
+		adrp, ldr, br := insns[i], insns[i+1], insns[i+3]
+		if adrp.Mnemonic != "adrp" || ldr.Mnemonic != "ldr" || br.Mnemonic != "br" {
+			continue
+		}
+		if len(adrp.Operands) != 2 || adrp.Operands[1].Type != OperandImm {
+			continue
+		}
+		if len(ldr.Operands) != 2 || ldr.Operands[1].Type != OperandMem {
+			continue
+		}
+		page := uint64(adrp.Operands[1].Imm)
+		gotAddr := page + uint64(int64(ldr.Operands[1].Mem.Disp))
+		if name, ok := gotToName[gotAddr]; ok {
+			result[adrp.Address] = name
+		}
+	}
+
+	return result, nil
+}
