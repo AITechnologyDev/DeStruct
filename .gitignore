@@ -30,6 +30,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+<<<<<<< HEAD
 
 #Dirs
 output/
@@ -44,3 +45,5 @@ test/
 *.kt
 *test
 destruct
+=======
+>>>>>>> 7fe5f18cfd6746ebc5d9819f14d24ba3a1c6a44a
