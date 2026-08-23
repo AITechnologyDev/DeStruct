@@ -133,6 +133,15 @@ func buildCFG(instructions []native.DetailedInstruction) []*BasicBlock {
 // immediate operand (the absolute address, since Capstone already
 // resolves the PC-relative encoding for us).
 func branchTarget(inst native.DetailedInstruction) (uint64, bool) {
+	if isCompareBranch(inst) {
+		// "cbz/cbnz Rt, label" carries its target as the SECOND operand
+		// (the first is the register being tested) - unlike a plain "b"
+		// or "b.cond", whose only operand IS the target.
+		if len(inst.Operands) != 2 || inst.Operands[1].Type != native.OperandImm {
+			return 0, false
+		}
+		return uint64(inst.Operands[1].Imm), true
+	}
 	if !isAnyBranch(inst) {
 		return 0, false
 	}
@@ -158,13 +167,28 @@ func isAnyBranch(inst native.DetailedInstruction) bool {
 	return isConditionalBranch(inst)
 }
 
-// isConditionalBranch reports whether inst is a conditional branch
-// (b.eq, b.ne, b.le, b.gt, b.lt, b.ge, ...) - recognized by mnemonic
-// prefix, since Capstone folds the ARM64 condition code into the
-// mnemonic string itself rather than exposing it as a separate operand
-// or field.
+// isConditionalBranch reports whether inst is a conditional branch:
+// b.eq/b.ne/b.le/b.gt/b.lt/b.ge/... (recognized by mnemonic prefix, since
+// Capstone folds the ARM64 condition code into the mnemonic string itself
+// rather than exposing it as a separate operand or field), or cbz/cbnz
+// (compare-and-branch-on-zero/nonzero - a self-contained condition on one
+// register, not a flags test, but still a two-successor branch the same
+// as b.cond for CFG purposes; see isCompareBranch).
 func isConditionalBranch(inst native.DetailedInstruction) bool {
+	if isCompareBranch(inst) {
+		return true
+	}
 	return len(inst.Mnemonic) > 2 && inst.Mnemonic[0] == 'b' && inst.Mnemonic[1] == '.'
+}
+
+// isCompareBranch reports whether inst is "cbz Rt, label" or "cbnz Rt,
+// label" - ARM64's compare-and-branch instructions, extremely common for
+// null/zero checks and loop conditions. Unlike b.cond, these test a
+// register directly against zero and don't read the NZCV flags at all,
+// so they need their own branchTarget/liftCondition handling rather than
+// condOpFromMnemonic's flag-based mapping.
+func isCompareBranch(inst native.DetailedInstruction) bool {
+	return inst.Mnemonic == "cbz" || inst.Mnemonic == "cbnz"
 }
 
 // SymbolResolver resolves a call target's absolute address to a
@@ -324,6 +348,21 @@ func (l *lifter) fork() *lifter {
 // by run() while lifting that cmp, which is why liftBlockGraph lifts a
 // block's body (including its own trailing cmp) before calling this.
 func (l *lifter) liftCondition(inst native.DetailedInstruction) ir.Expr {
+	if isCompareBranch(inst) {
+		// cbz/cbnz test their own register operand against zero directly
+		// - no preceding cmp involved at all (see isCompareBranch), so
+		// this bypasses lastCmp entirely rather than treating a missing
+		// cmp as the "not yet handled" case below does for b.cond.
+		if len(inst.Operands) == 0 || inst.Operands[0].Type != native.OperandReg {
+			return &ir.LocalVar{Name: "cond"}
+		}
+		op := "=="
+		if inst.Mnemonic == "cbnz" {
+			op = "!="
+		}
+		return &ir.BinaryExpr{Op: op, Left: l.regValue(inst.Operands[0].Reg), Right: &ir.IntLit{Value: 0}}
+	}
+
 	op := condOpFromMnemonic(inst.Mnemonic)
 	if l.lastCmp == nil {
 		// No preceding cmp was lifted (e.g. this branch tests flags
@@ -347,15 +386,38 @@ func condOpFromMnemonic(mnemonic string) string {
 		return "=="
 	case "b.ne":
 		return "!="
-	case "b.lt":
+	case "b.lt", "b.mi":
+		// b.mi (negative) after a cmp is the signed "<" case: cmp lhs,
+		// rhs sets N=1 exactly when lhs-rhs is negative, i.e. lhs < rhs.
 		return "<"
 	case "b.le":
 		return "<="
 	case "b.gt":
 		return ">"
-	case "b.ge":
+	case "b.ge", "b.pl":
+		// b.pl (positive-or-zero) is signed ">=" by the same reasoning
+		// as b.mi above.
 		return ">="
+	case "b.hi":
+		// Unsigned '>' - this project's IR doesn't distinguish signed
+		// from unsigned comparisons, so this renders identically to the
+		// signed operator; wrong only when the operands could actually
+		// be negative, which is rare for the size/length/pointer
+		// comparisons that generate b.hi/b.ls/b.hs/b.lo in practice.
+		return ">"
+	case "b.ls":
+		return "<="
+	case "b.hs", "b.cs":
+		return ">="
+	case "b.lo", "b.cc":
+		return "<"
 	default:
+		// b.vs/b.vc (signed overflow) and b.al/b.nv (always) don't fit
+		// this lhs-op-rhs shape at all - true overflow-flag testing has
+		// no plain comparison equivalent, and an unconditional-as-if-
+		// conditional branch shouldn't be built from this path in the
+		// first place. Left as an honest placeholder rather than a
+		// guess; see the TODO at the bottom of this file.
 		return "?"
 	}
 }
@@ -458,25 +520,32 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 
 	for _, inst := range instructions {
 		switch inst.Mnemonic {
+		case "add":
+			if isSpAdjust(inst) {
+				// "add sp, sp, #N" is the matching -O0 epilogue - same
+				// reasoning as the sub case below.
+				continue
+			}
+			l.liftBinaryALU(inst, "+")
 		case "sub":
 			// "sub sp, sp, #N" is the standard -O0 prologue reserving
 			// stack frame space - not part of the source program's own
 			// logic (no C statement corresponds to it), so it's
 			// recognized and silently skipped rather than lifted into
-			// a meaningless "sp = sp - 16" statement. Any other "sub"
-			// (not targeting sp, or not matching this exact shape) is
-			// deliberately NOT specially handled yet and falls through
-			// unlifted - see the TODO at the bottom of this function.
+			// a meaningless "sp = sp - 16" statement. Any other "sub" is
+			// a real subtraction.
 			if isSpAdjust(inst) {
 				continue
 			}
-		case "add":
-			if isSpAdjust(inst) {
-				// "add sp, sp, #N" is the matching -O0 epilogue - same
-				// reasoning as the sub case above.
-				continue
-			}
-			l.liftAdd(inst)
+			l.liftBinaryALU(inst, "-")
+		case "and":
+			l.liftBinaryALU(inst, "&")
+		case "orr":
+			l.liftBinaryALU(inst, "|")
+		case "eor":
+			l.liftBinaryALU(inst, "^")
+		case "mul":
+			l.liftBinaryALU(inst, "*")
 		case "stp":
 			// "stp x29, x30, [sp, #-N]!" is the standard -O0
 			// frame-pointer prologue (saving the caller's frame
@@ -505,7 +574,9 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 				continue
 			}
 		case "str":
-			l.liftStr(inst)
+			if s := l.liftStr(inst); s != nil {
+				stmts = append(stmts, s)
+			}
 		case "ldr":
 			l.liftLdr(inst)
 		case "cmp":
@@ -593,43 +664,67 @@ func isFramePointerEstablish(inst native.DetailedInstruction) bool {
 	return inst.Operands[1].Type == native.OperandReg && inst.Operands[1].Reg == "sp"
 }
 
-// liftStr lifts "str Rt, [Rn, #disp]" - a store to memory. The only
-// shape currently recognized is spilling a parameter-carrying register
-// to a stack slot (the -O0 prologue pattern of copying each incoming
-// argument register to its own stack slot immediately on function
-// entry, so the register itself is free to be reused later) - which
-// isn't lifted into a memory-store statement at all, since it has no
-// source-level equivalent; it just teaches the lifter that this stack
-// slot means this parameter, so a later "ldr" from the same slot
-// resolves back to it (see liftLdr).
-func (l *lifter) liftStr(inst native.DetailedInstruction) {
+// liftStr lifts "str Rt, [Rn, #disp]" - a store to memory. Two shapes are
+// recognized:
+//
+//  1. Rn is sp: the -O0 prologue pattern of spilling an incoming
+//     parameter-carrying register to its own stack slot immediately on
+//     function entry, so the register itself is free to be reused later.
+//     Not lifted into a store statement at all, since it has no source-
+//     level equivalent; it just teaches the lifter that this stack slot
+//     means this parameter, so a later "ldr" from the same slot resolves
+//     back to it (see liftLdr). Returns nil (nothing to emit).
+//  2. Rn is any other register: a real pointer write - "str x1, [x0,
+//     #8]" is x0->field_0x8 = x1, the standard shape for "this->member =
+//     value" (or any other pointer's field write) at -O0. Unlike the
+//     stack-slot case, this DOES have direct source-level meaning, so it
+//     returns a real AssignStmt for run() to include in the function's
+//     body. The field is named generically after its byte offset
+//     (field_0xN) since nothing in the binary records the real member
+//     name without DWARF; see the TODO at the bottom of this file.
+//
+// Any other shape (indexed addressing, a non-register source, ...) isn't
+// lifted yet - returns nil, same as case 1.
+func (l *lifter) liftStr(inst native.DetailedInstruction) ir.Stmt {
 	if len(inst.Operands) != 2 {
-		return
+		return nil
 	}
 	srcOp, dstOp := inst.Operands[0], inst.Operands[1]
 	if srcOp.Type != native.OperandReg || dstOp.Type != native.OperandMem {
-		return
+		return nil
 	}
-	if dstOp.Mem.Base != "sp" || dstOp.Mem.Index != "" {
-		return
+	if dstOp.Mem.Index != "" {
+		return nil
 	}
 
-	if name, ok := l.paramNameForReg(srcOp.Reg); ok {
-		l.stack[dstOp.Mem.Disp] = name
+	if dstOp.Mem.Base == "sp" {
+		if name, ok := l.paramNameForReg(srcOp.Reg); ok {
+			l.stack[dstOp.Mem.Disp] = name
+		}
+		return nil
 	}
-	// A store of anything else (a non-parameter register, or to a slot
-	// not otherwise recognized) isn't lifted yet - falls through with
-	// no effect, which is safe (produces no statement) but incomplete;
-	// see the TODO at the bottom of this file.
+	if dstOp.Mem.Base == "" {
+		return nil
+	}
+
+	field := &ir.FieldAccess{Object: l.regValue(dstOp.Mem.Base), Name: fieldName(dstOp.Mem.Disp)}
+	return &ir.AssignStmt{Target: field, Value: l.regValue(srcOp.Reg)}
 }
 
-// liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. The only
-// shape currently recognized is reloading a value previously spilled by
-// liftStr: if this displacement was recorded as holding a named
-// parameter, the destination register now holds an IR reference to that
-// same parameter (not a "load" statement - there's nothing to say at
-// the source level; the parameter's value simply flows into the
-// register that will use it next).
+// liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. Two shapes
+// are recognized, mirroring liftStr:
+//
+//  1. Rn is sp, and this displacement was previously recorded (by
+//     liftStr) as holding a named parameter: the destination register
+//     now holds an IR reference to that same parameter (not a "load"
+//     statement - there's nothing to say at the source level; the
+//     parameter's value simply flows into the register that will use it
+//     next).
+//  2. Rn is any other register: a real pointer read - "ldr x1, [x0, #8]"
+//     is x1 = x0->field_0x8, read into the register file the same way
+//     an ordinary computed value would be (not emitted as its own
+//     statement; becomes source-level meaningful once something actually
+//     consumes it, same reasoning as liftBinaryALU/liftCall).
 func (l *lifter) liftLdr(inst native.DetailedInstruction) {
 	if len(inst.Operands) != 2 {
 		return
@@ -638,34 +733,65 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) {
 	if dstOp.Type != native.OperandReg || srcOp.Type != native.OperandMem {
 		return
 	}
-	if srcOp.Mem.Base != "sp" || srcOp.Mem.Index != "" {
+	if srcOp.Mem.Index != "" {
 		return
 	}
 
-	if name, ok := l.stack[srcOp.Mem.Disp]; ok {
-		l.regs[dstOp.Reg] = &ir.LocalVar{Name: name}
+	if srcOp.Mem.Base == "sp" {
+		if name, ok := l.stack[srcOp.Mem.Disp]; ok {
+			l.regs[dstOp.Reg] = &ir.LocalVar{Name: name}
+		}
+		return
 	}
+	if srcOp.Mem.Base == "" {
+		return
+	}
+
+	l.regs[dstOp.Reg] = &ir.FieldAccess{Object: l.regValue(srcOp.Mem.Base), Name: fieldName(srcOp.Mem.Disp)}
 }
 
-// liftAdd lifts "add Rd, Rn, Rm" (register-register add; the immediate
-// form "add Rd, Rn, #imm" isn't handled yet - see the TODO at the
-// bottom of this file) into an IR BinaryExpr, recorded as Rd's new
-// value in the register file - not emitted as a statement yet, since a
-// bare arithmetic result with nothing done with it isn't source-level
-// meaningful on its own; it becomes a statement once something (a
-// return, a store, ...) actually consumes it.
-func (l *lifter) liftAdd(inst native.DetailedInstruction) {
+// fieldName synthesizes a generic member name for a struct/class field
+// access at the given byte displacement - nothing in the binary records
+// the real field name without DWARF debug info (which this project
+// doesn't consume), so a stable, offset-derived name is used rather than
+// guessing; see the TODO at the bottom of this file.
+func fieldName(disp int32) string {
+	if disp < 0 {
+		return fmt.Sprintf("field_neg0x%x", -disp)
+	}
+	return fmt.Sprintf("field_0x%x", disp)
+}
+
+// liftBinaryALU lifts a 3-operand ALU instruction ("add/sub/and/orr/eor/mul
+// Rd, Rn, Rm" or "..., Rn, #imm" - register or immediate second source
+// operand; ARM64 allows an immediate for add/sub but not for the others,
+// though nothing here needs to enforce that distinction since a Capstone
+// decode simply won't produce an immediate operand for the instructions
+// that can't take one) into an IR BinaryExpr, recorded as Rd's new value
+// in the register file - not emitted as a statement yet, since a bare
+// arithmetic result with nothing done with it isn't source-level
+// meaningful on its own; it becomes a statement once something (a return,
+// a store, ...) actually consumes it.
+func (l *lifter) liftBinaryALU(inst native.DetailedInstruction, op string) {
 	if len(inst.Operands) != 3 {
 		return
 	}
 	dstOp, lhsOp, rhsOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
-	if dstOp.Type != native.OperandReg || lhsOp.Type != native.OperandReg || rhsOp.Type != native.OperandReg {
+	if dstOp.Type != native.OperandReg || lhsOp.Type != native.OperandReg {
 		return
 	}
 
 	lhs := l.regValue(lhsOp.Reg)
-	rhs := l.regValue(rhsOp.Reg)
-	l.regs[dstOp.Reg] = &ir.BinaryExpr{Op: "+", Left: lhs, Right: rhs}
+	var rhs ir.Expr
+	switch rhsOp.Type {
+	case native.OperandReg:
+		rhs = l.regValue(rhsOp.Reg)
+	case native.OperandImm:
+		rhs = &ir.IntLit{Value: rhsOp.Imm}
+	default:
+		return
+	}
+	l.regs[dstOp.Reg] = &ir.BinaryExpr{Op: op, Left: lhs, Right: rhs}
 }
 
 // liftCall lifts "bl <addr>" - a direct function call. The target
@@ -897,13 +1023,36 @@ func (l *lifter) liftRet() ir.Stmt {
 	return &ir.ReturnStmt{Value: val}
 }
 
-// TODO(next iterations): this lifter currently only understands the
-// exact instruction shapes needed for "int add(int a, int b) { return a
-// + b; }" at -O0. Real growth areas, roughly in order of how often
-// real-world -O0 code needs them: immediate-operand arithmetic (add Rd,
-// Rn, #imm), more ALU ops (sub/mul/and/orr/eor/...), comparisons and
-// conditional branches (cmp + b.cond -> if/else), calls (bl -> function
-// call expressions), non-parameter stack locals (regular local
-// variables, not just spilled parameters), and loads/stores to
-// non-stack memory (real pointer dereferences, not just the stack-slot
-// bookkeeping this version does).
+// TODO(next iterations): what this lifter now handles, beyond the
+// original "int add(int a, int b) { return a + b; }" -O0 baseline:
+// immediate and register ALU (add/sub/and/orr/eor/mul), if/else via
+// cmp+b.cond AND cbz/cbnz, unsigned/negative/positive condition codes
+// (b.hi/b.ls/b.hs/b.lo/b.mi/b.pl - see condOpFromMnemonic), calls, and
+// pointer field access (str/ldr through a non-sp base register). Real
+// growth areas still open, roughly in order of how often real-world -O0
+// C++ needs them:
+//
+//   - Loops. liftBlockGraph only recognizes the if/else shape (both
+//     successors reachable, neither looping back); a conditional branch
+//     whose target is its own block's start address (or an ancestor's)
+//     is a real loop, and today just gets treated as an already-visited
+//     block and silently dropped instead of becoming a WhileStmt/ForStmt.
+//     This is probably the single biggest gap against real code, which
+//     is full of loops (see this package's own arm64lift work driven by
+//     the il2cpp_memory_dumper sample: parse_maps, hex_to_u64, trim,
+//     split, find_il2cpp_api all loop).
+//   - Array/indexed memory access (MemOperand.Index isn't consulted by
+//     liftStr/liftLdr at all yet - only [base, #disp] is handled, not
+//     [base, index] or [base, index, lsl #N]).
+//   - Exception-handling control flow (try/catch, __cxa_begin_catch/
+//     __cxa_end_catch, landing pads reached via the LSDA/.gcc_except_table
+//     rather than an ordinary branch) is indistinguishable from normal
+//     control flow to this lifter right now, and gets lifted as if it
+//     were - actively misleading rather than merely incomplete.
+//   - Call argument recovery is a heuristic (see liftCall's own doc
+//     comment) - registers left over from unrelated earlier code can be
+//     misattributed as a call's arguments.
+//   - tbz/tbnz (bit-test-and-branch) aren't recognized as branches at
+//     all yet, unlike cbz/cbnz.
+//   - A real Itanium demangler (see demangle's doc comment) instead of
+//     showing mangled names as-is.

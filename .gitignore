@@ -42,5 +42,6 @@ test/
 *.class
 *.java
 *.kt
-*test
+/*test
 /destruct
+/lifttest
