@@ -275,8 +275,24 @@ type loopCtx struct {
 // prevents infinite recursion on unexpected/malformed input rather than
 // hanging).
 func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) []ir.Stmt {
-	if b == nil || visited[b.StartAddr] {
+	if b == nil {
 		return nil
+	}
+	if visited[b.StartAddr] {
+		// Reaching an already-visited block via the plain
+		// single-successor path (the only way this can happen at all,
+		// since a fork always gets its OWN visited copy - see
+		// liftLoopEdge's own reasoning) always means a genuine
+		// back-edge/cycle in THIS lineage, recognized as a loop or
+		// not (tryLiftWhileLoop can fail to recognize an unusual
+		// shape - e.g. a short-circuit "||" compound condition, where
+		// EITHER successor of the head can reach back - and still
+		// fall back to ordinary if/else). Either way, this path has
+		// reached the true end of what it will ever contribute -
+		// exactly like a real leaf - so anything it computed and left
+		// unconsumed must be flushed now, or it would silently vanish
+		// (this is what a plain "return nil" here used to do).
+		return l.flushRemaining()
 	}
 	// See lifter.budget's own doc comment: this bounds the exponential
 	// blowup an if/else split with no merge-point sharing is otherwise
@@ -469,6 +485,77 @@ func (l *lifter) reachesAddr(startAddr, target uint64, byAddr map[uint64]*BasicB
 	return false
 }
 
+// isPlainConditionLink reports whether blk has the exact minimal shape
+// a real compiler ever emits for one extra link in a short-circuit
+// "&&"/"||" chain: nothing but a single condition test, with no other
+// work at all - either just the conditional branch itself (cbz/cbnz/
+// tbz/tbnz, which test a register directly), or a "cmp" immediately
+// followed by the branch (b.cond, which needs the cmp to set the
+// flags it tests). Requiring this exact shape (checked by
+// tryOrChainLink before it commits to treating a block as a chain
+// link at all) is what keeps this from ever misreading real BODY code
+// that happens to contain its own if/branch as "more of the
+// condition" instead - genuine body code essentially always does
+// something (a call, a store, arithmetic) beyond a bare test.
+func isPlainConditionLink(blk *BasicBlock) bool {
+	switch len(blk.Instructions) {
+	case 1:
+		return true
+	case 2:
+		return blk.Instructions[0].Mnemonic == "cmp"
+	default:
+		return false
+	}
+}
+
+// tryOrChainLink attempts to extend a short-circuit "a || b" (or
+// "!a || b", depending on which of tryLiftWhileLoop's two successors
+// this is tried for) while-condition by treating addr as one more
+// condition test: addr must be a fresh isPlainConditionLink block
+// whose own two successors split cleanly into "reaches back to
+// headAddr" (continuing the loop - either straight into the real
+// body, or, in a 3+-deep chain, into yet another link this function
+// does NOT itself recurse into - see below) and "does not" (a
+// candidate real exit) - the exact same non-ambiguous shape
+// tryLiftWhileLoop's own first two cases already require, just
+// checked against addr instead of head.
+//
+// Only ONE extra link is ever attempted (no recursion): a 3+-deep
+// "a || b || c" chain would need addr's own "reaches back" successor
+// resolved the same ambiguous way tryLiftWhileLoop's caller already
+// tried once here, and doing that safely (without leaving partial
+// side effects from a failed deeper attempt on l, which isn't forked
+// for this speculative check) is more machinery than this iteration
+// spends on what's already a comparatively rare shape - it safely
+// falls back to ordinary if/else instead (still lossless, thanks to
+// liftBlockGraph's flush-on-already-visited handling).
+//
+// Side effects (running addr's own instructions and lifting its
+// condition, which can consume registers / touch l.lastCmp) only
+// happen once the shape is confirmed clean - never on a path that's
+// about to return ok=false - so a caller trying a second candidate
+// address after this one fails is never working with a
+// partially-mutated l.
+func (l *lifter) tryOrChainLink(headAddr, addr uint64, byAddr map[uint64]*BasicBlock, outerLoop *loopCtx) (cond ir.Expr, bodyAddr, exitAddr uint64, ok bool) {
+	blk, exists := byAddr[addr]
+	if !exists || blk.LastCond == nil || len(blk.Succs) != 2 || !isPlainConditionLink(blk) {
+		return nil, 0, 0, false
+	}
+	t, e := blk.Succs[0], blk.Succs[1]
+	tLoops := l.reachesAddr(t, headAddr, byAddr, outerLoop)
+	eLoops := l.reachesAddr(e, headAddr, byAddr, outerLoop)
+	switch {
+	case tLoops && !eLoops:
+		l.run(blk.Instructions[:len(blk.Instructions)-1])
+		return l.liftCondition(*blk.LastCond), t, e, true
+	case eLoops && !tLoops:
+		l.run(blk.Instructions[:len(blk.Instructions)-1])
+		return &ir.UnaryExpr{Op: "!", Expr: l.liftCondition(*blk.LastCond)}, e, t, true
+	default:
+		return nil, 0, 0, false
+	}
+}
+
 // tryLiftWhileLoop attempts to recognize head (a block ending in the
 // conditional branch already lifted into cond, with thenAddr/elseAddr
 // as its two successors - Succs[0]/Succs[1], per BasicBlock.Succs' own
@@ -476,11 +563,28 @@ func (l *lifter) reachesAddr(startAddr, target uint64, byAddr map[uint64]*BasicB
 // exactly one of the two successors can reach back to head itself by
 // SOME path (via reachesAddr - the body, which may freely contain its
 // own nested control flow, unlike a straight-line-only chain), while
-// the other cannot (what runs after the loop exits). If BOTH can (an
-// irregular shape, e.g. two independent back-edges converging) or
-// NEITHER can (not a loop at all), this returns ok=false so the caller
+// the other cannot (what runs after the loop exits).
+//
+// A compiled "a && b (&& ...)" while-condition never reaches this
+// ambiguous case at all: only ONE of head's two successors ever
+// reaches back (the "keep testing" arm - the OTHER test, then
+// eventually the body), while the other is a clean, non-looping exit;
+// each further "&&" link is then just an ordinary nested conditional
+// found while lifting what looks like "the body" (see
+// liftBlockGraph's own if/else case, which tries THIS function again
+// for it) - no special handling needed here at all.
+//
+// "a || b" is different: head's DIRECT short-circuit entry into the
+// body loops back just like the body itself does, so BOTH successors
+// satisfy reachesAddr, and tryOrChainLink is what disambiguates which
+// one is really "one more condition to fold in with ||" versus the
+// real body. If that fails too (an irregular shape, or a 3+-deep
+// "||" chain - see tryOrChainLink's own doc comment for why only one
+// extra link is attempted), this returns ok=false so the caller
 // (liftBlockGraph) falls back to treating it as an ordinary if/else -
-// always a safe default, never a wrong guess.
+// always a safe default (never a wrong guess, and never lossy: see
+// liftBlockGraph's own flush-on-already-visited handling), just not
+// as pretty as a real "while" would be.
 //
 // outerLoop is whatever loop context liftBlockGraph itself was already
 // lifting inside of (nil at the top level) - threaded through to the
@@ -504,6 +608,19 @@ func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, else
 		// EXIT, so entering the body means the branch was NOT taken:
 		// the real while-condition is cond's negation.
 		bodyAddr, exitAddr, whileCond = elseAddr, thenAddr, &ir.UnaryExpr{Op: "!", Expr: cond}
+	case thenLoops && elseLoops:
+		// The short-circuit "a || b" shape - see this function's own
+		// doc comment. Try elseAddr as the extra link first (the
+		// far-more-common compiled orientation: branch-taken enters
+		// the body directly, fallthrough continues testing), then
+		// thenAddr (the mirror image), before giving up.
+		if subCond, subBody, subExit, ok := l.tryOrChainLink(head.StartAddr, elseAddr, byAddr, outerLoop); ok {
+			bodyAddr, exitAddr, whileCond = subBody, subExit, &ir.BinaryExpr{Op: "||", Left: cond, Right: subCond}
+		} else if subCond, subBody, subExit, ok := l.tryOrChainLink(head.StartAddr, thenAddr, byAddr, outerLoop); ok {
+			bodyAddr, exitAddr, whileCond = subBody, subExit, &ir.BinaryExpr{Op: "||", Left: &ir.UnaryExpr{Op: "!", Expr: cond}, Right: subCond}
+		} else {
+			return nil, false
+		}
 	default:
 		return nil, false
 	}
@@ -1692,17 +1809,21 @@ func (l *lifter) liftRet() ir.Stmt {
 // void-call statement emission, adrp/adr string-literal resolution,
 // ldr-through-GOT global-object resolution, "while (cond) { body }"
 // loops (cmp+b.cond, cbz/cbnz, or tbz/tbnz) INCLUDING bodies with their
-// own nested if/else, break/continue, or nested loops, and more
-// ALU/shift ops (sub/and/orr/eor/mul/lsl/lsr/asr) are now handled (see
-// liftCall/liftMov/flushRemaining, liftAddr/buildCall's StringResolver
-// use, liftLdr's addrRegs+resolver use with ELFParser.ResolveGOT,
-// tryLiftWhileLoop/reachesAddr/liftLoopEdge, and liftALU). Remaining
-// growth areas, roughly in order of how often real-world -O0 code
-// needs them:
-//   - Compound (&&/||) while-conditions, which compile to MULTIPLE
-//     chained conditional-branch blocks (each able to exit the loop)
-//     rather than a single one - tryLiftWhileLoop only ever looks at
-//     ONE block's own condition.
+// own nested if/else, break/continue, or nested loops, compound "&&"
+// conditions (these fall out of the nested-body handling for free -
+// see tryLiftWhileLoop's own doc comment) and one-link "||" conditions
+// (tryOrChainLink), and more ALU/shift ops (sub/and/orr/eor/mul/lsl/
+// lsr/asr) are now handled (see liftCall/liftMov/flushRemaining,
+// liftAddr/buildCall's StringResolver use, liftLdr's addrRegs+resolver
+// use with ELFParser.ResolveGOT, tryLiftWhileLoop/reachesAddr/
+// liftLoopEdge, and liftALU). Remaining growth areas, roughly in order
+// of how often real-world -O0 code needs them:
+//   - A 3+-deep "||" chain ("a || b || c") - tryOrChainLink
+//     deliberately only ever resolves one extra link (see its own doc
+//     comment for why: avoiding partial side effects from a failed
+//     speculative deeper attempt on the shared, unforked lifter).
+//     Falls back to ordinary (still lossless) if/else, same as any
+//     other unrecognized shape.
 //   - do/for-shaped back-edges where the condition check is the LAST
 //     block of the body rather than the first (this iteration only
 //     recognizes the condition-first "while" shape - reachesAddr asks

@@ -561,3 +561,180 @@ func TestLiftFunction_LoopWithUnconditionalBreak(t *testing.T) {
 		t.Errorf("expected the else-branch's second statement to be a BreakStmt, got %T: %v", ifStmt.Else.Statements[1], ifStmt.Else.Statements[1])
 	}
 }
+
+// TestLiftFunction_CompoundAndCondition lifts a hand-built instruction
+// stream equivalent to:
+//
+//	while (a < n && b != 0) {
+//	    step();
+//	}
+//	return a;
+//
+// exercising a compiled "&&" while-condition's standard shape: a chain
+// of condition-test blocks where only ONE successor per link ever
+// reaches back (the "keep testing, then eventually the body" arm),
+// never both - so this never even reaches tryLiftWhileLoop's ambiguous
+// case (unlike the "||" case - see TestLiftFunction_CompoundOrCondition)
+// and needs no special chain-collapsing logic: the second condition
+// is simply an ordinary nested if/break, discovered as "the body" via
+// the SAME structural matcher recursing into itself. Semantically
+// identical to a real "&&", just not textually fused into one - see
+// tryLiftWhileLoop's own doc comment for why that's an accepted,
+// deliberate scope limit.
+func TestLiftFunction_CompoundAndCondition(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// h1 @ 0x0: cmp a, n
+		{Address: 0x0, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandReg, Reg: "w1"},
+		}},
+		// b.ge exit(0x18)   (if a >= n, exit)
+		{Address: 0x4, Size: 4, Mnemonic: "b.ge", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// h2 @ 0x8: cbz b, exit(0x18)   (if b == 0, exit)
+		{Address: 0x8, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// body @ 0xc: bl step(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// @ 0x10: b h1(0x0)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x0},
+		}},
+		// exit @ 0x18: ret
+		{Address: 0x18, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+	stmts := LiftFunction(insns, []string{"a", "n", "b"}, resolver, nil)
+
+	var while *ir.WhileStmt
+	for _, s := range stmts {
+		if w, ok := s.(*ir.WhileStmt); ok {
+			while = w
+		}
+	}
+	if while == nil {
+		t.Fatalf("expected a WhileStmt among the top-level statements, got %v", stmts)
+	}
+	if while.Body == nil || len(while.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the outer loop body (the nested if), got %v", while.Body)
+	}
+	ifStmt, ok := while.Body.Statements[0].(*ir.IfStmt)
+	if !ok {
+		t.Fatalf("expected the body statement to be an IfStmt (the second, nested \"&&\" condition), got %T: %v", while.Body.Statements[0], while.Body.Statements[0])
+	}
+	// cbz's condition ("b == 0") lifts as the branch-TAKEN condition
+	// (see liftCondition's own doc comment) - branch-taken is Succs[0]
+	// here, which is the real exit (b == 0 means the "&&" is false),
+	// so the then-branch is the break and the else-branch is the body.
+	if ifStmt.Then == nil || len(ifStmt.Then.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the if's then-branch, got %v", ifStmt.Then)
+	}
+	if _, ok := ifStmt.Then.Statements[0].(*ir.BreakStmt); !ok {
+		t.Errorf("expected the then-branch to be a BreakStmt (b was 0, so exit the loop), got %T: %v", ifStmt.Then.Statements[0], ifStmt.Then.Statements[0])
+	}
+	if ifStmt.Else == nil || len(ifStmt.Else.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the if's else-branch (the flushed step() call), got %v", ifStmt.Else)
+	}
+	if call, ok := ifStmt.Else.Statements[0].(*ir.ExprStmt); !ok {
+		t.Errorf("expected the else-branch's statement to be an ExprStmt, got %T: %v", ifStmt.Else.Statements[0], ifStmt.Else.Statements[0])
+	} else if sc, ok := call.Expr.(*ir.StaticMethodCall); !ok || sc.Method != "step" {
+		t.Errorf("expected a call to \"step\", got %#v", call.Expr)
+	}
+}
+
+// TestLiftFunction_CompoundOrCondition lifts a hand-built instruction
+// stream equivalent to:
+//
+//	while (a != 0 || b != 0) {
+//	    step();
+//	}
+//	return a;
+//
+// exercising a compiled "||" while-condition's standard short-circuit
+// shape: head's OWN branch-taken arm enters the body directly (a
+// true), while its fallthrough continues to a second test (b) whose
+// own branch-taken arm is the real exit and fallthrough enters the
+// (same) body. Both of head's own successors satisfy reachesAddr here
+// (the direct-entry arm loops back via the body's own back-edge; the
+// second-test arm loops back via ITS eventual body-entry too) -
+// tryOrChainLink is what disambiguates this from an ordinary
+// (non-loop) if/else and folds the second test into a combined "||"
+// condition. Before this, this exact shape either wasn't recognized
+// as a loop at all, or - a real bug this test also guards against -
+// silently dropped step() from whichever arm reached the
+// already-visited head block first.
+func TestLiftFunction_CompoundOrCondition(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// h1 @ 0x0: cbnz a, body(0xc)   (if a != 0, enter body directly)
+		{Address: 0x0, Size: 4, Mnemonic: "cbnz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0xc},
+		}},
+		// h2 @ 0x4: cbz b, exit(0x18)   (if b == 0, exit; else fall to body)
+		{Address: 0x4, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// @ 0x8: b body(0xc)
+		{Address: 0x8, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0xc},
+		}},
+		// body @ 0xc: bl step(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// @ 0x10: b h1(0x0)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x0},
+		}},
+		// exit @ 0x18: ret
+		{Address: 0x18, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+	stmts := LiftFunction(insns, []string{"a", "b"}, resolver, nil)
+
+	var while *ir.WhileStmt
+	for _, s := range stmts {
+		if w, ok := s.(*ir.WhileStmt); ok {
+			while = w
+		}
+	}
+	if while == nil {
+		t.Fatalf("expected a single WhileStmt (the \"||\" condition folded together) among the top-level statements, got %v", stmts)
+	}
+
+	or, ok := while.Cond.(*ir.BinaryExpr)
+	if !ok || or.Op != "||" {
+		t.Fatalf("expected cond to be a \"||\" expression, got %#v", while.Cond)
+	}
+	leftCmp, ok := or.Left.(*ir.BinaryExpr)
+	if !ok || leftCmp.Op != "!=" {
+		t.Errorf("expected the left side to be a \"!=\" comparison (from cbnz), got %#v", or.Left)
+	}
+
+	if while.Body == nil || len(while.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the loop body (the flushed step() call - previously either 0 (silently dropped) or the loop wasn't recognized at all), got %v", while.Body)
+	}
+	exprStmt, ok := while.Body.Statements[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the body statement to be an ExprStmt, got %T: %v", while.Body.Statements[0], while.Body.Statements[0])
+	}
+	if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected a call to \"step\", got %#v", exprStmt.Expr)
+	}
+}
