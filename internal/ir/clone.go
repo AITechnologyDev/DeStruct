@@ -146,6 +146,8 @@ func CloneExpr(e Expr) Expr {
 		return &MethodCall{Object: CloneExpr(v.Object), Name: v.Name, Args: cloneExprs(v.Args)}
 	case *StaticMethodCall:
 		return &StaticMethodCall{Class: v.Class, Method: v.Method, Args: cloneExprs(v.Args)}
+	case *IndirectCall:
+		return &IndirectCall{Callee: CloneExpr(v.Callee), Args: cloneExprs(v.Args)}
 	case *NewExpr:
 		return &NewExpr{Type: v.Type, Args: cloneExprs(v.Args)}
 	case *NewArrayExpr:

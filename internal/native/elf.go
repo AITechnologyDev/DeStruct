@@ -872,3 +872,57 @@ func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
 
 	return result, nil
 }
+
+// SymbolResolver returns a single address->name lookup combining this
+// ELF's own .symtab/.dynsym entries, PLT stub resolution (ResolvePLT),
+// and GOT/relocation-based global-object resolution (ResolveGOT) - the
+// shared oracle a caller like arm64lift.LiftFunction needs for both
+// call targets (bl/blr/tail-call "b"/"br") and GOT/data-slot addresses
+// an "ldr" dereferences (see arm64lift's own doc comments for why the
+// same lookup serves both). PLT/GOT resolution failures are silently
+// ignored here (that half of the lookup just contributes nothing) -
+// callers that want to know why should call ResolvePLT/ResolveGOT
+// themselves.
+//
+// A function symbol (STT_FUNC) with no name - real -O0 code sometimes
+// emits these for hand-written assembly helpers using local rather
+// than global linkage, e.g. libunwind's own low-level register-restore
+// trampoline - is given a synthetic "sub_<address>" name rather than
+// being silently excluded, matching how other disassemblers/
+// decompilers name unnamed routines. This is what lets a tail call to
+// one of these still be recognized as a genuine call instead of being
+// dropped for looking unresolvable: arm64lift's own liftTailCall/
+// liftBr both deliberately require a RESOLVED target (see their own
+// doc comments for why - an unresolved branch is far more likely an
+// intra-function control-flow edge this lifter doesn't yet understand
+// than a real call), and "no name at all" would otherwise be
+// indistinguishable from that.
+func (p *ELFParser) SymbolResolver() func(addr uint64) (string, bool) {
+	plt, _ := p.ResolvePLT()
+	got, _ := p.ResolveGOT()
+
+	const sttFunc = 2
+	symByAddr := make(map[uint64]string)
+	for _, sym := range p.Symbols {
+		name := p.GetSymbolName(sym)
+		if name == "" && sym.Info&0xf == sttFunc && sym.Value != 0 {
+			name = fmt.Sprintf("sub_%x", sym.Value)
+		}
+		if name != "" {
+			symByAddr[sym.Value] = name
+		}
+	}
+
+	return func(addr uint64) (string, bool) {
+		if name, ok := symByAddr[addr]; ok {
+			return name, true
+		}
+		if name, ok := plt[addr]; ok {
+			return name, true
+		}
+		if name, ok := got[addr]; ok {
+			return name, true
+		}
+		return "", false
+	}
+}

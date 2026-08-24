@@ -5,7 +5,6 @@ import (
 	"os"
 
 	"github.com/destruct/destruct/internal/arm64lift"
-	"github.com/destruct/destruct/internal/ir"
 	"github.com/destruct/destruct/internal/native"
 )
 
@@ -57,84 +56,12 @@ func main() {
 		panic(err)
 	}
 
-	plt, err := p.ResolvePLT()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: PLT resolution failed: %v\n", err)
-		plt = nil
-	}
-
-	got, err := p.ResolveGOT()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: GOT resolution failed: %v\n", err)
-		got = nil
-	}
-
-	symByAddr := make(map[uint64]string)
-	for _, sym := range p.Symbols {
-		if name := p.GetSymbolName(sym); name != "" {
-			symByAddr[sym.Value] = name
-		}
-	}
-
-	// One shared address->name oracle for both call targets (bl/tail
-	// call "b") and GOT/data-slot addresses an "ldr" dereferences (see
-	// liftLdr's own doc comment) - the same lookup, just fed a
-	// different kind of address depending on the caller.
-	resolver := func(addr uint64) (string, bool) {
-		if name, ok := symByAddr[addr]; ok {
-			return name, true
-		}
-		if name, ok := plt[addr]; ok {
-			return name, true
-		}
-		if name, ok := got[addr]; ok {
-			return name, true
-		}
-		return "", false
-	}
-
+	resolver := p.SymbolResolver()
 	strResolver := func(addr uint64) (string, bool) {
 		return p.ReadCString(addr)
 	}
 
 	stmts := arm64lift.LiftFunction(insns, params, resolver, strResolver)
 	fmt.Printf("// %s\n", symName)
-	printStmts(stmts, 1)
-}
-
-func printStmts(stmts []ir.Stmt, depth int) {
-	indent := ""
-	for i := 0; i < depth; i++ {
-		indent += "    "
-	}
-	for _, s := range stmts {
-		switch v := s.(type) {
-		case *ir.IfStmt:
-			fmt.Printf("%sif (%s) {\n", indent, v.Cond)
-			if v.Then != nil {
-				printStmts(v.Then.Statements, depth+1)
-			}
-			fmt.Printf("%s}", indent)
-			if v.Else != nil && len(v.Else.Statements) > 0 {
-				fmt.Printf(" else {\n")
-				printStmts(v.Else.Statements, depth+1)
-				fmt.Printf("%s}", indent)
-			}
-			fmt.Println()
-		case *ir.WhileStmt:
-			fmt.Printf("%swhile (%s) {\n", indent, v.Cond)
-			if v.Body != nil {
-				printStmts(v.Body.Statements, depth+1)
-			}
-			fmt.Printf("%s}\n", indent)
-		case *ir.DoWhileStmt:
-			fmt.Printf("%sdo {\n", indent)
-			if v.Body != nil {
-				printStmts(v.Body.Statements, depth+1)
-			}
-			fmt.Printf("%s} while (%s);\n", indent, v.Cond)
-		default:
-			fmt.Printf("%s%s\n", indent, s)
-		}
-	}
+	arm64lift.RenderStmts(os.Stdout, stmts, 1)
 }

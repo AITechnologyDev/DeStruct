@@ -147,6 +147,14 @@ func (e *StaticMethodCall) String() string {
 	return fmt.Sprintf("%s.%s(%s)", e.Class, e.Method, strings.Join(args, ", "))
 }
 
+func (e *IndirectCall) String() string {
+	args := make([]string, len(e.Args))
+	for i, a := range e.Args {
+		args[i] = fmt.Sprint(a)
+	}
+	return fmt.Sprintf("(%s)(%s)", e.Callee, strings.Join(args, ", "))
+}
+
 func (e *NewExpr) String() string {
 	args := make([]string, len(e.Args))
 	for i, a := range e.Args {

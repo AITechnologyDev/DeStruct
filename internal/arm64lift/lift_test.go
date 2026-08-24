@@ -1562,3 +1562,109 @@ func TestLiftFunction_CompoundOrConditionThreeDeep(t *testing.T) {
 		t.Errorf("expected a call to \"step\", got %#v", exprStmt.Expr)
 	}
 }
+
+// TestLiftFunction_IndirectCall lifts a hand-built instruction stream
+// equivalent to:
+//
+//	void call_through_ptr(void (*fp)()) {
+//	    fp();
+//	}
+//
+// exercising "blr Rn" - an ordinary call through a register, the same
+// as "bl" except the callee is an arbitrary expression rather than a
+// resolved symbol (see buildIndirectCall's own doc comment).
+func TestLiftFunction_IndirectCall(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// blr x0    (call fp())
+		{Address: 0x0, Size: 4, Mnemonic: "blr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "ret"},
+	}
+
+	stmts := LiftFunction(insns, []string{"fp"}, nil, nil)
+
+	var ret *ir.ReturnStmt
+	for _, s := range stmts {
+		if v, ok := s.(*ir.ReturnStmt); ok {
+			ret = v
+		}
+	}
+	if ret == nil {
+		t.Fatalf("expected a ReturnStmt (fp()'s result flows into w0/x0, then \"ret\") among the top-level statements, got %v", stmts)
+	}
+	call, ok := ret.Value.(*ir.IndirectCall)
+	if !ok {
+		t.Fatalf("expected the return value to be an IndirectCall, got %#v", ret.Value)
+	}
+	callee, ok := call.Callee.(*ir.LocalVar)
+	if !ok || callee.Name != "fp" {
+		t.Errorf("expected the callee to be local var \"fp\", got %#v", call.Callee)
+	}
+}
+
+// TestLiftFunction_IndirectTailCall lifts a hand-built instruction
+// stream equivalent to the standard -O0 codegen for a C++
+// virtual-dispatch thunk:
+//
+//	// thunk for some virtual method, forwarding straight to the real
+//	// implementation looked up through obj's own vtable:
+//	ldr x8, [x0]        ; vtable = obj->vtable (obj in x0, the receiver)
+//	ldr x16, [x8, #64]  ; fn = vtable[8] (slot 8, 8 bytes each)
+//	br x16              ; tail-call fn(obj) - "this" already in x0
+//
+// exercising "br Rn" - an indirect JUMP through a register, in tail
+// position - together with the general (non-stack) memory access
+// support from an earlier round: the callee is a FieldAccess chain
+// (obj->field_0->field_64), not just a bare register.
+func TestLiftFunction_IndirectTailCall(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// ldr x8, [x0, #0]
+		{Address: 0x0, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x8"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0", Disp: 0}},
+		}},
+		// ldr x16, [x8, #64]
+		{Address: 0x4, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x16"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x8", Disp: 64}},
+		}},
+		// br x16
+		{Address: 0x8, Size: 4, Mnemonic: "br", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x16"},
+		}},
+	}
+
+	stmts := LiftFunction(insns, []string{"obj"}, nil, nil)
+
+	if len(stmts) != 1 {
+		t.Fatalf("expected exactly 1 top-level statement (the tail call), got %v", stmts)
+	}
+	exprStmt, ok := stmts[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected an ExprStmt, got %T: %v", stmts[0], stmts[0])
+	}
+	call, ok := exprStmt.Expr.(*ir.IndirectCall)
+	if !ok {
+		t.Fatalf("expected an IndirectCall, got %#v", exprStmt.Expr)
+	}
+	outer, ok := call.Callee.(*ir.FieldAccess)
+	if !ok || outer.Name != "field_64" {
+		t.Fatalf("expected the callee to be a FieldAccess named \"field_64\", got %#v", call.Callee)
+	}
+	inner, ok := outer.Object.(*ir.FieldAccess)
+	if !ok || inner.Name != "field_0" {
+		t.Fatalf("expected the outer field's object to be a FieldAccess named \"field_0\", got %#v", outer.Object)
+	}
+	obj, ok := inner.Object.(*ir.LocalVar)
+	if !ok || obj.Name != "obj" {
+		t.Errorf("expected the innermost object to be local var \"obj\", got %#v", inner.Object)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected exactly 1 forwarded argument (obj, this thunk's own receiver), got %v", call.Args)
+	}
+	arg, ok := call.Args[0].(*ir.LocalVar)
+	if !ok || arg.Name != "obj" {
+		t.Errorf("expected the forwarded argument to be local var \"obj\", got %#v", call.Args[0])
+	}
+}

@@ -112,11 +112,18 @@ func buildCFG(instructions []native.DetailedInstruction) []*BasicBlock {
 			} else {
 				b.Succs = []uint64{target}
 			}
-		} else if last.Mnemonic != "ret" {
+		} else if last.Mnemonic != "ret" && last.Mnemonic != "br" {
 			// Falls through to the next block in address order (no
 			// branch at all ended this block - it just ran out of
 			// leaders, meaning the next leader is reached by ordinary
-			// sequential execution).
+			// sequential execution). "ret" and "br" are both real ends
+			// of this path with no statically knowable successor at all
+			// (br's target is whatever's in its register, not
+			// something branchTarget can ever resolve - see its own doc
+			// comment) - Succs stays nil/empty for both, a true leaf,
+			// rather than wrongly assuming whatever instruction happens
+			// to follow in the byte stream is reachable by falling
+			// through.
 			fallthroughAddr := last.Address + uint64(last.Size)
 			if _, ok := byAddr[fallthroughAddr]; ok {
 				b.Succs = []uint64{fallthroughAddr}
@@ -150,15 +157,18 @@ func branchTarget(inst native.DetailedInstruction) (uint64, bool) {
 	return uint64(last.Imm), true
 }
 
-// isAnyBranch reports whether inst is any kind of direct branch this
-// lifter currently recognizes as ending a basic block: unconditional
-// "b", or a conditional one (see isConditionalBranch). "bl" (call)
-// deliberately does NOT end a block here - a call returns control to
-// the next instruction, so it doesn't change the function's own
-// control flow the way a real branch does; see the TODO at the bottom
-// of lift.go for when calls themselves get lifted.
+// isAnyBranch reports whether inst is any kind of direct or indirect
+// branch this lifter currently recognizes as ending a basic block:
+// unconditional "b", indirect "br" (jumps through a register rather
+// than an immediate target - see liftBr's own doc comment; by far the
+// most common real -O0 shape is a C++ virtual-dispatch thunk: load a
+// vtable slot, jump through it), or a conditional one (see
+// isConditionalBranch). "bl"/"blr" (calls, direct or indirect)
+// deliberately do NOT end a block here - a call returns control to the
+// next instruction, so it doesn't change the function's own control
+// flow the way a real branch does.
 func isAnyBranch(inst native.DetailedInstruction) bool {
-	if inst.Mnemonic == "b" {
+	if inst.Mnemonic == "b" || inst.Mnemonic == "br" {
 		return true
 	}
 	return isConditionalBranch(inst)
@@ -1376,6 +1386,8 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			l.liftCmp(inst)
 		case "bl":
 			stmts = append(stmts, l.liftCall(inst)...)
+		case "blr":
+			stmts = append(stmts, l.liftBlr(inst)...)
 		case "cset":
 			stmts = append(stmts, l.liftCset(inst)...)
 		case "ret":
@@ -1388,6 +1400,10 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// liftTailCall's own doc comment for why it's only lifted
 			// when its target resolves to a known symbol.
 			stmts = append(stmts, l.liftTailCall(inst)...)
+		case "br":
+			// Same reasoning as "b" above, just through a register - see
+			// liftBr's own doc comment.
+			stmts = append(stmts, l.liftBr(inst)...)
 		}
 	}
 
@@ -1793,6 +1809,52 @@ func (l *lifter) liftMov(inst native.DetailedInstruction) []ir.Stmt {
 	}
 }
 
+// collectCallArgs gathers a call's own arguments from x0-x7 (AAPCS64's
+// integer/pointer argument registers) as they stand right now, before
+// the call overwrites any of them with its own return value - shared
+// by buildCall (a direct call, resolved by address) and
+// buildIndirectCall (a call through whatever a register currently
+// holds - "blr"/"br"), since collecting the arguments themselves
+// doesn't depend on how the callee is identified. Stops at the first
+// register this lifter never actually assigned a value to (see
+// regValue's own placeholder-on-miss behavior; checked directly
+// against l.regs here rather than through regValue, since regValue
+// itself can't distinguish "genuinely holds this register's raw value
+// because nothing overwrote it" from "known assigned value"). This is
+// a heuristic, not a real signature lookup (nothing in the binary
+// reliably encodes how many arguments a given call actually passes) -
+// it works for the common case where a function's own argument-passing
+// code runs immediately before the call and doesn't happen to also
+// touch unrelated argument registers for other reasons, but can
+// overcount or undercount on more unusual codegen. See the TODO at the
+// bottom of this file.
+func (l *lifter) collectCallArgs() []ir.Expr {
+	var args []ir.Expr
+	for _, reg := range aapcs64IntArgRegs {
+		v, ok := l.regs[reg]
+		if !ok {
+			break
+		}
+		// If this register currently holds a known address (from
+		// adrp/adr, possibly via a following add - see addrRegs' own
+		// doc comment) and it resolves to an actual string literal,
+		// render the literal itself rather than the raw computed
+		// address - this is the whole point of tracking addrRegs in
+		// the first place. Falls back to the placeholder numeric value
+		// already in v when the address doesn't resolve (most likely:
+		// it's some other kind of data - a pointer, a vtable - not a
+		// plain C string).
+		if addr, isAddr := l.addrRegs[reg]; isAddr && l.strings != nil {
+			if s, ok := l.strings(addr); ok {
+				v = &ir.StringLit{Value: s}
+			}
+		}
+		l.consume(v)
+		args = append(args, v)
+	}
+	return args
+}
+
 // buildCall resolves target to a readable name via l.resolver (falling
 // back to a "func_<address>" placeholder if resolution fails or there
 // is no resolver) and builds the call expression from whatever's
@@ -1821,44 +1883,7 @@ func (l *lifter) buildCall(target uint64, requireResolved bool) (ir.Expr, bool) 
 	}
 	name := demangle(rawName)
 
-	// Collect arguments from x0-x7 (AAPCS64's integer/pointer argument
-	// registers) as they stand right now, before this call overwrites
-	// any of them with its own return value - stopping at the first
-	// register this lifter never actually assigned a value to (see
-	// regValue's own placeholder-on-miss behavior; checked directly
-	// against l.regs here rather than through regValue, since regValue
-	// itself can't distinguish "genuinely holds this register's raw
-	// value because nothing overwrote it" from "known assigned value").
-	// This is a heuristic, not a real signature lookup (nothing in the
-	// binary reliably encodes how many arguments a given call actually
-	// passes) - it works for the common case where a function's own
-	// argument-passing code runs immediately before the call and
-	// doesn't happen to also touch unrelated argument registers for
-	// other reasons, but can overcount or undercount on more unusual
-	// codegen. See the TODO at the bottom of this file.
-	var args []ir.Expr
-	for _, reg := range aapcs64IntArgRegs {
-		v, ok := l.regs[reg]
-		if !ok {
-			break
-		}
-		// If this register currently holds a known address (from
-		// adrp/adr, possibly via a following add - see addrRegs' own
-		// doc comment) and it resolves to an actual string literal,
-		// render the literal itself rather than the raw computed
-		// address - this is the whole point of tracking addrRegs in
-		// the first place. Falls back to the placeholder numeric value
-		// already in v when the address doesn't resolve (most likely:
-		// it's some other kind of data - a pointer, a vtable - not a
-		// plain C string).
-		if addr, isAddr := l.addrRegs[reg]; isAddr && l.strings != nil {
-			if s, ok := l.strings(addr); ok {
-				v = &ir.StringLit{Value: s}
-			}
-		}
-		l.consume(v)
-		args = append(args, v)
-	}
+	args := l.collectCallArgs()
 
 	// A mangled Itanium C++ instance method name (recognized by the
 	// standard "_ZN...E" nested-name pattern, as opposed to a free
@@ -1870,21 +1895,21 @@ func (l *lifter) buildCall(target uint64, requireResolved bool) (ir.Expr, bool) 
 	// the mangled name alone without a real demangler that understands
 	// the full grammar; see the TODO at the bottom of this file.
 	//
-	// Also excluded: args[0] itself being a call result (*MethodCall or
-	// *StaticMethodCall) - without real stack-slot tracking, this
-	// lifter can't tell "x0 holds a genuinely-reloaded object pointer"
-	// from "x0 still holds the PREVIOUS call's leftover return value"
-	// in general, but it CAN identify this one case, which is never a
-	// valid `this` (a real `this` is a variable/pointer value, not
-	// literally the return value of some unrelated call) - excluding it
-	// avoids the worst symptom (a nonsensical call1().call2().call3()
-	// dot-chain from independent sequential calls) even though the
-	// underlying ambiguity for other cases remains unresolved. See the
-	// TODO at the bottom of this file.
+	// Also excluded: args[0] itself being a call result (*MethodCall,
+	// *StaticMethodCall, or *IndirectCall) - without real stack-slot
+	// tracking, this lifter can't tell "x0 holds a genuinely-reloaded
+	// object pointer" from "x0 still holds the PREVIOUS call's leftover
+	// return value" in general, but it CAN identify this one case,
+	// which is never a valid `this` (a real `this` is a variable/
+	// pointer value, not literally the return value of some unrelated
+	// call) - excluding it avoids the worst symptom (a nonsensical
+	// call1().call2().call3() dot-chain from independent sequential
+	// calls) even though the underlying ambiguity for other cases
+	// remains unresolved. See the TODO at the bottom of this file.
 	isCallResult := false
 	if len(args) > 0 {
 		switch args[0].(type) {
-		case *ir.MethodCall, *ir.StaticMethodCall:
+		case *ir.MethodCall, *ir.StaticMethodCall, *ir.IndirectCall:
 			isCallResult = true
 		}
 	}
@@ -1960,6 +1985,58 @@ func (l *lifter) liftTailCall(inst native.DetailedInstruction) []ir.Stmt {
 	if !ok {
 		return nil
 	}
+	stmts := l.finishCall(call)
+	l.consume(call)
+	return append(stmts, &ir.ExprStmt{Expr: call})
+}
+
+// buildIndirectCall builds a call expression whose callee is an
+// arbitrary EXPRESSION - whatever calleeReg currently holds - rather
+// than a name resolved from a statically known address, for "blr Rn"
+// (an ordinary call through a register) and "br Rn" (the same, but in
+// tail position - see liftBr's own doc comment). There's no symbol to
+// resolve here at all, so unlike buildCall this never fails: the
+// callee is rendered as whatever expression is available, even if
+// that's just a raw register-name placeholder (see regValue's own doc
+// comment) when this lifter never learned anything more specific about
+// it - most often, in real -O0 C++ code, a vtable slot loaded through a
+// chain of FieldAccess dereferences (see liftLdr's own doc comment).
+func (l *lifter) buildIndirectCall(calleeReg string) ir.Expr {
+	callee := l.regValue(calleeReg)
+	l.consume(callee)
+	return &ir.IndirectCall{Callee: callee, Args: l.collectCallArgs()}
+}
+
+// liftBlr lifts "blr Rn" - an ordinary call through a register - into
+// a call expression recorded as w0/x0's new value, exactly like
+// liftCall does for "bl", just with buildIndirectCall's
+// resolved-from-a-register callee instead of buildCall's
+// resolved-from-an-address one.
+func (l *lifter) liftBlr(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
+		return nil
+	}
+	call := l.buildIndirectCall(inst.Operands[0].Reg)
+	return l.finishCall(call)
+}
+
+// liftBr lifts "br Rn" - an unconditional, indirect JUMP through a
+// register (ending this block's own control flow - see isAnyBranch's
+// own doc comment on why this counts as a branch for CFG purposes,
+// unlike "blr") - as an indirect tail call: the standard -O0 shape for
+// a C++ virtual-dispatch thunk (load a vtable slot, tail-call through
+// it, forwarding this function's own arguments unchanged) that
+// liftTailCall's own "b <addr>" handling can't cover, since there's no
+// resolvable address here at all. Exactly like liftTailCall: by
+// definition nothing in THIS function reads the result afterward (a
+// real "ret" would have been used instead if something did), so it's
+// emitted as its own ExprStmt immediately rather than left pending for
+// flushRemaining.
+func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
+		return nil
+	}
+	call := l.buildIndirectCall(inst.Operands[0].Reg)
 	stmts := l.finishCall(call)
 	l.consume(call)
 	return append(stmts, &ir.ExprStmt{Expr: call})
@@ -2055,7 +2132,7 @@ func (l *lifter) isOrphanCandidate(e ir.Expr, exceptReg string) bool {
 		return false
 	}
 	switch e.(type) {
-	case *ir.MethodCall, *ir.StaticMethodCall:
+	case *ir.MethodCall, *ir.StaticMethodCall, *ir.IndirectCall:
 	default:
 		return false
 	}

@@ -522,6 +522,11 @@ func collectImports(class *ir.Class) []string {
 			for _, arg := range v.Args {
 				walkExpr(arg)
 			}
+		case *ir.IndirectCall:
+			walkExpr(v.Callee)
+			for _, arg := range v.Args {
+				walkExpr(arg)
+			}
 		case *ir.FieldAccess:
 			walkExpr(v.Object)
 		case *ir.BinaryExpr:

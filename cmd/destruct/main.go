@@ -57,7 +57,7 @@ Commands:
   assemble  Assemble .hasm back to .hbc bytecode (with address recalculation)
   patch     Search/patch Hermes .hbc bytecode
   flutter   Disassemble Flutter libapp.so to readable Dart bytecode
-  elf       Disassemble ELF binaries to readable assembly
+  elf       Disassemble ELF binaries to readable assembly (--decompile: AArch64-only pseudocode)
   pe        Disassemble PE binaries to readable assembly
   version   Show version
   help      Show this help
@@ -67,7 +67,9 @@ Options:
   -i, --input         Input HBC file (for assemble/patch)
   -v, --verbose       Verbose output
   --deobfuscate       Enable deobfuscation
-  --decompile         Use decompiler (hermes: output .js, flutter: output .dart)
+  --decompile         Use decompiler (hermes: output .js, flutter: output .dart,
+                       elf: output C-like pseudocode for every function in one
+                       file - AArch64 binaries only)
   -s, --search        Search for string in bytecode
   -t, --patch-string  Quick patch: replace instruction with string operand (true/false/nop)
   -p, --patch         Generate simplified format for manual patching
@@ -99,6 +101,7 @@ Quick patch workflow:
 
 Examples:
   destruct jvm input.jar -o output/
+  destruct elf libnative.so -o output/ --decompile  # AArch64 pseudocode, one file
   destruct hermes index.android.bundle -o output/ --decompile
   destruct hermes index.android.bundle -o output/ -p  # Simplified format
   destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc --hermes-dec
@@ -122,12 +125,12 @@ func handleJVM(args []string) {
 	}
 
 	p := pipeline.New(pipeline.Options{
-		Input:    input,
-		Output:   opts.output,
-		Format:   pipeline.FormatJVM,
-		Verbose:  opts.verbose,
-		Deobf:    opts.deobfuscate,
-		Project:  opts.project,
+		Input:   input,
+		Output:  opts.output,
+		Format:  pipeline.FormatJVM,
+		Verbose: opts.verbose,
+		Deobf:   opts.deobfuscate,
+		Project: opts.project,
 	})
 
 	if err := p.Run(); err != nil {
@@ -436,7 +439,7 @@ func handlePatch(args []string) {
 			// If offset is small (< first function size), it's function 0
 			// Otherwise, find the function
 			relOffset := instr.Offset
-			
+
 			// Find which function this belongs to
 			// Since offsets reset to 0 for each function in the HASM,
 			// we need to track based on function boundaries
@@ -485,12 +488,12 @@ func handleFlutter(args []string) {
 	}
 
 	p := pipeline.New(pipeline.Options{
-		Input:    input,
-		Output:   opts.output,
-		Format:   pipeline.FormatFlutter,
-		Verbose:  opts.verbose,
-		Deobf:    opts.deobfuscate,
-		Project:  opts.project,
+		Input:   input,
+		Output:  opts.output,
+		Format:  pipeline.FormatFlutter,
+		Verbose: opts.verbose,
+		Deobf:   opts.deobfuscate,
+		Project: opts.project,
 	})
 
 	if err := p.Run(); err != nil {
@@ -509,12 +512,13 @@ func handleELF(args []string) {
 	}
 
 	p := pipeline.New(pipeline.Options{
-		Input:    input,
-		Output:   opts.output,
-		Format:   pipeline.FormatELF,
-		Verbose:  opts.verbose,
-		Deobf:    opts.deobfuscate,
-		Project:  opts.project,
+		Input:     input,
+		Output:    opts.output,
+		Format:    pipeline.FormatELF,
+		Verbose:   opts.verbose,
+		Deobf:     opts.deobfuscate,
+		Project:   opts.project,
+		Decompile: opts.decompile,
 	})
 
 	if err := p.Run(); err != nil {
@@ -533,12 +537,12 @@ func handlePE(args []string) {
 	}
 
 	p := pipeline.New(pipeline.Options{
-		Input:    input,
-		Output:   opts.output,
-		Format:   pipeline.FormatPE,
-		Verbose:  opts.verbose,
-		Deobf:    opts.deobfuscate,
-		Project:  opts.project,
+		Input:   input,
+		Output:  opts.output,
+		Format:  pipeline.FormatPE,
+		Verbose: opts.verbose,
+		Deobf:   opts.deobfuscate,
+		Project: opts.project,
 	})
 
 	if err := p.Run(); err != nil {

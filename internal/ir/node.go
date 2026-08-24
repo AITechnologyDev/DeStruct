@@ -281,6 +281,15 @@ type (
 		Method string
 		Args   []Expr
 	}
+	// IndirectCall is a call through an arbitrary callee EXPRESSION
+	// rather than a statically known name - a function-pointer call, or
+	// (the far more common real-world case) a C++ virtual-dispatch
+	// thunk jumping through a loaded vtable slot, where there's no
+	// symbol to resolve at all.
+	IndirectCall struct {
+		Callee Expr
+		Args   []Expr
+	}
 	NewExpr struct {
 		Type string
 		Args []Expr
@@ -348,6 +357,7 @@ func (*LocalVar) exprNode()         {}
 func (*FieldAccess) exprNode()      {}
 func (*MethodCall) exprNode()       {}
 func (*StaticMethodCall) exprNode() {}
+func (*IndirectCall) exprNode()     {}
 func (*NewExpr) exprNode()          {}
 func (*NewArrayExpr) exprNode()     {}
 func (*ArrayInitExpr) exprNode()    {}

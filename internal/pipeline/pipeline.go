@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/csharp"
 	unflutter "github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/cmd/unflutter"
 	"github.com/destruct/destruct/internal/ir"
@@ -28,12 +29,13 @@ const (
 )
 
 type Options struct {
-	Input   string
-	Output  string
-	Format  Format
-	Verbose bool
-	Deobf   bool
-	Project bool
+	Input     string
+	Output    string
+	Format    Format
+	Verbose   bool
+	Deobf     bool
+	Project   bool
+	Decompile bool
 }
 
 type Pipeline struct {
@@ -320,6 +322,10 @@ func (p *Pipeline) decompileELFOrPE() (*ir.Program, error) {
 }
 
 func (p *Pipeline) disassembleELF() error {
+	if p.opts.Decompile {
+		return p.decompileELFArm64()
+	}
+
 	fmt.Printf("Parsing ELF file: %s\n", p.opts.Input)
 
 	// Create output file
@@ -335,5 +341,112 @@ func (p *Pipeline) disassembleELF() error {
 	}
 
 	fmt.Printf("Disassembly: %s\n", outPath)
+	return nil
+}
+
+// decompileELFArm64 lifts every function symbol in an AArch64 ELF
+// binary to C-like pseudocode (see internal/arm64lift) and writes the
+// whole binary's output to a SINGLE file, one function after another -
+// unlike disassembleELF's raw listing, this recovers real control flow
+// (if/else, while/do-while loops, calls, locals, struct field access)
+// rather than a flat instruction stream. Only AArch64 is supported (the
+// lifter itself is architecture-specific); any other machine type
+// fails fast with a clear error rather than silently producing
+// nonsense output.
+//
+// Never aborts the whole run over one function: a panic recovered
+// during a single function's own lift (this lifter is still a
+// best-effort heuristic system, not a verified one - see
+// internal/arm64lift/lift.go's own trailing doc comment for its
+// documented, honest limitations) is reported inline as a comment in
+// the output and counted, not fatal.
+func (p *Pipeline) decompileELFArm64() error {
+	fmt.Printf("Parsing ELF file: %s\n", p.opts.Input)
+
+	elf, err := native.NewELFParser(p.opts.Input)
+	if err != nil {
+		return fmt.Errorf("parsing ELF: %w", err)
+	}
+	if elf.Header.Machine != native.EM_AARCH64 {
+		return fmt.Errorf("arm64 decompilation requires an AArch64 binary (machine type 0x%x found) - use plain \"destruct elf\" (without --decompile) for a raw disassembly of any architecture instead", elf.Header.Machine)
+	}
+
+	d, err := native.NewARM64Disassembler()
+	if err != nil {
+		return fmt.Errorf("creating disassembler: %w", err)
+	}
+	defer d.Close()
+
+	resolver := elf.SymbolResolver()
+	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
+
+	outPath := filepath.Join(p.opts.Output, filepath.Base(p.opts.Input)+".decompiled.c")
+	f, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("create output file: %w", err)
+	}
+	defer f.Close()
+
+	const sttFunc = 2
+	var ok, empty, failed int
+	lastReport := time.Now()
+	for i := range elf.Symbols {
+		sym := elf.Symbols[i]
+		if sym.Info&0xf != sttFunc || sym.Size == 0 {
+			continue
+		}
+		name := elf.GetSymbolName(sym)
+		if name == "" {
+			continue
+		}
+
+		var sec *native.SectionHeader
+		for j := range elf.Sections {
+			s := &elf.Sections[j]
+			if sym.Value >= s.Addr && sym.Value < s.Addr+s.Size {
+				sec = s
+				break
+			}
+		}
+		if sec == nil {
+			continue
+		}
+		fileOff := sec.Offset + (sym.Value - sec.Addr)
+		if fileOff+sym.Size > uint64(len(elf.Data)) {
+			continue
+		}
+		code := elf.Data[fileOff : fileOff+sym.Size]
+		insns, err := d.DisassembleDetailed(code, sym.Value)
+		if err != nil || len(insns) == 0 {
+			continue
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					failed++
+					fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", name, r)
+				}
+			}()
+			stmts := arm64lift.LiftFunction(insns, nil, resolver, strResolver)
+			if len(stmts) == 0 {
+				empty++
+			} else {
+				ok++
+			}
+			fmt.Fprintf(f, "// %s\n", name)
+			arm64lift.RenderStmts(f, stmts, 0)
+			fmt.Fprintln(f)
+		}()
+
+		if p.opts.Verbose {
+			fmt.Printf("  [%d/%d/%d ok/empty/failed] %s\n", ok, empty, failed, name)
+		} else if time.Since(lastReport) > time.Second {
+			fmt.Printf("  ... %d functions decompiled\n", ok+empty+failed)
+			lastReport = time.Now()
+		}
+	}
+
+	fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, outPath)
 	return nil
 }
