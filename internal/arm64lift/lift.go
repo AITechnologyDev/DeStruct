@@ -1440,14 +1440,14 @@ func isFramePointerEstablish(inst native.DetailedInstruction) bool {
 	return inst.Operands[1].Type == native.OperandReg && inst.Operands[1].Reg == "sp"
 }
 
-// liftStr lifts "str Rt, [sp, #disp]" - a store to a stack slot. Two
-// shapes:
+// liftStr lifts "str Rt, [Rn, #disp]" - a store to memory. Two shapes:
 //
-//   - The FIRST store to a fresh slot, where Rt currently holds one of
-//     this function's own parameters (checked by the VALUE currently
-//     in Rt via regValue/isParam, not merely by which physical
-//     register Rt happens to be - unlike an early version of this
-//     check, which matched on the register name alone and could
+//   - [sp, #disp] - a stack slot. Two further cases:
+//     -- The FIRST store to a fresh slot, where Rt currently holds one
+//     of this function's own parameters (checked by the VALUE
+//     currently in Rt via regValue/isParam, not merely by which
+//     physical register Rt happens to be - unlike an early version of
+//     this check, which matched on the register name alone and could
 //     therefore mistake a later, genuine reassignment through that
 //     same register for another silent spill, silently dropping it -
 //     see below): the standard -O0 prologue pattern of copying each
@@ -1456,8 +1456,8 @@ func isFramePointerEstablish(inst native.DetailedInstruction) bool {
 //     silently (no statement); it just teaches the lifter that this
 //     slot means this parameter, so a later "ldr" from the same slot
 //     resolves back to it (see liftLdr).
-//   - Anything else is a genuine source-level assignment: either the
-//     first store to a fresh slot (a new local variable's own
+//     -- Anything else is a genuine source-level assignment: either
+//     the first store to a fresh slot (a new local variable's own
 //     initialization - named deterministically from its stack
 //     displacement, "local_<disp>", so independent forks that each
 //     discover the same slot fresh - see fork's own doc comment on why
@@ -1465,8 +1465,26 @@ func isFramePointerEstablish(inst native.DetailedInstruction) bool {
 //     name without needing to coordinate) or a later store to an
 //     already-named slot (reassigning that local, or even a parameter
 //     whose value has since changed via that same slot, e.g. "n = n +
-//     1;" spilled back to n's own stack home). Lifted as an ordinary
-//     AssignStmt.
+//     1;" spilled back to n's own stack home).
+//   - [Rn, #disp] for any other base Rn - a write through an arbitrary
+//     pointer (a struct field, an array element via a precomputed
+//     address, ...). Rendered as a FieldAccess on whatever expression
+//     Rn currently holds, named deterministically from disp alone
+//     ("field_<disp>") for the same reason stack locals are - there's
+//     no debug info to recover the real field name from, and a
+//     consistent synthetic one at least reads the same way at every
+//     use site. See liftLdr's own doc comment for the matching read
+//     side, and its own note on why the POINTER expression (unlike the
+//     value being stored here) is deliberately left unconsumed even
+//     when the read side embeds it into a value that might never
+//     itself be used.
+//
+// Both shapes always lift to a real AssignStmt (unconditionally part
+// of this instruction's own returned statements), which is exactly why
+// srcVal - the value actually being written - is always safe to
+// consume here: its presence in the output is guaranteed the moment
+// this function returns, unlike a register merely holding a value that
+// might go unread later.
 func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 2 {
 		return nil
@@ -1475,41 +1493,50 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	if srcOp.Type != native.OperandReg || dstOp.Type != native.OperandMem {
 		return nil
 	}
-	if dstOp.Mem.Base != "sp" || dstOp.Mem.Index != "" {
+	if dstOp.Mem.Index != "" {
 		return nil
 	}
-	disp := dstOp.Mem.Disp
 	srcVal := l.regValue(srcOp.Reg)
 
-	name, exists := l.stack[disp]
-	if !exists {
-		if lv, ok := srcVal.(*ir.LocalVar); ok && l.isParam(lv.Name) {
-			l.stack[disp] = lv.Name
-			return nil
+	if dstOp.Mem.Base == "sp" {
+		disp := dstOp.Mem.Disp
+		name, exists := l.stack[disp]
+		if !exists {
+			if lv, ok := srcVal.(*ir.LocalVar); ok && l.isParam(lv.Name) {
+				l.stack[disp] = lv.Name
+				return nil
+			}
+			name = fmt.Sprintf("local_%d", disp)
+			l.stack[disp] = name
 		}
-		name = fmt.Sprintf("local_%d", disp)
-		l.stack[disp] = name
+		l.consume(srcVal)
+		return []ir.Stmt{&ir.AssignStmt{Target: &ir.LocalVar{Name: name}, Value: srcVal}}
 	}
+
+	if dstOp.Mem.Base == "" {
+		return nil
+	}
+	// The pointer itself IS part of this AssignStmt's own Target
+	// (embedded directly, not merely referenced), so - unlike
+	// liftLdr's own base handling - it's safe to consume here too: its
+	// text is guaranteed to appear in this unconditionally-returned
+	// statement.
+	base := l.regValue(dstOp.Mem.Base)
+	l.consume(base)
 	l.consume(srcVal)
-	return []ir.Stmt{&ir.AssignStmt{Target: &ir.LocalVar{Name: name}, Value: srcVal}}
+	target := &ir.FieldAccess{Object: base, Name: fmt.Sprintf("field_%d", dstOp.Mem.Disp)}
+	return []ir.Stmt{&ir.AssignStmt{Target: target, Value: srcVal}}
 }
 
-// liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. The only
-// shape currently recognized is reloading a value previously spilled by
-// liftStr: if this displacement was recorded as holding a named
-// parameter, the destination register now holds an IR reference to that
-// same parameter (not a "load" statement - there's nothing to say at
-// the source level; the parameter's value simply flows into the
-// register that will use it next).
-// liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. Two shapes
-// are recognized:
+// liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. Three
+// shapes are recognized, tried in order:
 //
-//   - A stack slot previously spilled by liftStr: if this displacement
-//     was recorded as holding a named parameter, the destination
-//     register now holds an IR reference to that same parameter (not
-//     a "load" statement - there's nothing to say at the source
-//     level; the parameter's value simply flows into the register
-//     that will use it next).
+//   - A stack slot previously spilled by liftStr (Rn == sp): if this
+//     displacement was recorded as holding a named parameter OR local
+//     (see liftStr), the destination register now holds an IR
+//     reference to that same name (not a "load" statement - there's
+//     nothing to say at the source level; the value simply flows into
+//     the register that will use it next).
 //   - A GOT/data slot at a known computed address: Rn is a register
 //     addrRegs recorded an address for (see its own doc comment,
 //     populated by adrp/adr(+add)) - if the resolver knows a name for
@@ -1522,14 +1549,41 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 //     global object that the very next instruction typically uses as
 //     an implicit `this`/first argument to some call (an operator<<
 //     onto std::cout, say).
+//   - Anything else with a real base register: an arbitrary pointer
+//     dereference (a struct field, an array element via a
+//     precomputed address, ...) - rendered as a FieldAccess on
+//     whatever expression Rn currently holds, named deterministically
+//     from disp alone ("field_<disp>") the same way a fresh stack
+//     local is, since there's equally no debug info here to recover a
+//     real field name from.
 //
-// Anything else (a load from a register that's neither a stack slot
-// nor a known address, or one that IS a known address but doesn't
-// resolve to any name) isn't lifted yet, but the destination register
-// is still clobbered (see clobberReg): the real CPU DID overwrite it
-// with whatever the load actually produced, so leaving its old IR
-// value in place would misrepresent it as still holding that stale
-// value rather than an unknown freshly-loaded one.
+// Rn's own expression (the pointer being dereferenced) is deliberately
+// left unconsumed for the third shape, unlike every other place in
+// this file that embeds one expression into a larger one: the
+// resulting FieldAccess is only installed into Rt's register slot, NOT
+// unconditionally emitted as a statement the way liftStr's own
+// assignment always is - if Rt goes on to never actually be read, this
+// FieldAccess (and everything embedded in it) simply never appears in
+// the output at all, same as any other computed-but-discarded value in
+// this lifter's model (see liftAdd's own doc comment). Consuming Rn's
+// value here regardless would risk a REAL loss for the one case that
+// matters more: if Rn's value happens to be an unconsumed call result
+// (e.g. "ldr x1, [x0, #8]" right after "x0 = malloc()"), marking it
+// consumed here - based purely on being read, with no guarantee this
+// FieldAccess itself ever surfaces anywhere - could suppress
+// flushRemaining's own fallback flush of that call entirely, silently
+// dropping malloc() from the output altogether. Leaving it unconsumed
+// costs at most an occasional redundant-looking standalone flush of a
+// call whose result ALSO happens to be embedded in some later,
+// genuinely-used FieldAccess - a much safer trade than the reverse.
+//
+// A load that resolves to none of the above - a register that's
+// neither a stack slot, a known address, nor has a real base register
+// at all - isn't lifted, but the destination register is still
+// clobbered (see clobberReg): the real CPU DID overwrite it with
+// whatever the load actually produced, so leaving its old IR value in
+// place would misrepresent it as still holding that stale value rather
+// than an unknown freshly-loaded one.
 func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 2 {
 		return nil
@@ -1554,6 +1608,11 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 		if name, ok := l.resolver(addr); ok {
 			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: demangle(name)})
 		}
+	}
+
+	if srcOp.Mem.Base != "" {
+		val := &ir.FieldAccess{Object: l.regValue(srcOp.Mem.Base), Name: fmt.Sprintf("field_%d", srcOp.Mem.Disp)}
+		return l.setReg(dstOp.Reg, val)
 	}
 
 	return l.clobberReg(dstOp.Reg)
@@ -2160,33 +2219,32 @@ func (l *lifter) liftRet() ir.Stmt {
 // liftCall/liftMov/flushRemaining, liftAddr/buildCall's StringResolver
 // use, liftLdr's addrRegs+resolver use with ELFParser.ResolveGOT,
 // tryLiftWhileLoop/reachesAddr/liftLoopEdge, liftALU, and
-// tryLiftDoWhileLoop/findDoWhileTail/liftDoWhileTail), and non-parameter
+// tryLiftDoWhileLoop/findDoWhileTail/liftDoWhileTail), non-parameter
 // stack locals - a store to a fresh stack slot that ISN'T a parameter's
 // own first spill is now a genuine local variable, named
 // deterministically from its displacement ("local_<disp>") and emitted
 // as a real AssignStmt (see liftStr's own doc comment, including a real
 // bug this fixed: reassigning a PARAMETER's own stack slot through the
 // same register used to spill it originally was indistinguishable from
-// the initial spill and silently dropped the reassignment entirely).
-// Remaining growth areas, roughly in order of how often real-world -O0
-// code needs them:
+// the initial spill and silently dropped the reassignment entirely) -
+// and general (non-stack) memory access: "ldr"/"str" through any OTHER
+// base register (a struct field or array element access via an
+// arbitrary pointer, not just sp or a known GOT/data address) now
+// lifts to a real FieldAccess on whatever expression that register
+// currently holds, named deterministically from the displacement alone
+// ("field_<disp>") the same way a fresh stack local is, since there's
+// equally no debug info here to recover a real field name from (see
+// liftLdr/liftStr's own doc comments, including why the pointer
+// expression a LOAD reads is deliberately left unconsumed - unlike
+// every other value embedded into a larger expression in this file -
+// to avoid a real loss: if consuming it suppressed flushRemaining's
+// own fallback flush of a call the pointer's value came from, and the
+// resulting FieldAccess then went unused itself, that call's presence
+// would vanish from the output entirely). Remaining growth areas,
+// roughly in order of how often real-world -O0 code needs them:
 //   - A 3+-deep "||" chain ("a || b || c") - tryOrChainLink
 //     deliberately only ever resolves one extra link (see its own doc
 //     comment for why: avoiding partial side effects from a failed
 //     speculative deeper attempt on the shared, unforked lifter).
 //     Falls back to ordinary (still lossless) if/else, same as any
 //     other unrecognized shape.
-//   - Loads/stores to non-stack memory (real pointer dereferences -
-//     "ldr Rt, [Rn, #disp]"/"str Rt, [Rn, #disp]" where Rn isn't sp and
-//     doesn't resolve through addrRegs to a known symbol, e.g. a
-//     struct field or array element access through an arbitrary
-//     pointer). liftLdr currently just clobbers the destination
-//     register for this shape, and liftStr drops the store entirely
-//     (dstOp.Mem.Base != "sp" returns early with no effect at all) -
-//     unlike a stack slot, there's no simple integer key (a
-//     displacement alone) to name a slot by, since the SAME pointer
-//     value can arrive in different registers across different paths;
-//     doing this properly needs real pointer-expression tracking (e.g.
-//     rendering "Rn->field_<disp>" keyed by the pointer's own IR
-//     expression identity, not just a register name), which is a
-//     meaningfully bigger step than the stack-local case above.

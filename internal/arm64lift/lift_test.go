@@ -1241,3 +1241,208 @@ func TestLiftFunction_NonParamStackLocal(t *testing.T) {
 		t.Errorf("expected the return value to be the SAME local var the assignment targeted (%q), got %#v", target.Name, ret.Value)
 	}
 }
+
+// TestLiftFunction_PointerFieldLoad lifts a hand-built instruction
+// stream equivalent to:
+//
+//	void log_field(Obj* p) {
+//	    log(p->field_4);
+//	}
+//
+// exercising a general (non-stack) memory load: a field read through
+// an arbitrary pointer parameter, rendered as a FieldAccess and used
+// directly as a call argument. Deliberately loads INTO the same
+// register the pointer itself is read from (w0), so this also
+// exercises that the pointer's OLD value is captured before the
+// register is overwritten with the loaded result - exactly like real
+// AArch64 hardware evaluates "ldr Rt, [Rn, #disp]" even when Rt and Rn
+// are the same register.
+func TestLiftFunction_PointerFieldLoad(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// ldr w0, [x0, #4]    (w0 = p->field_4)
+		{Address: 0x0, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0", Disp: 4}},
+		}},
+		// bl log(0x100)
+		{Address: 0x4, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "log", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"p"}, resolver, nil)
+
+	var ret *ir.ReturnStmt
+	for _, s := range stmts {
+		if v, ok := s.(*ir.ReturnStmt); ok {
+			ret = v
+		}
+	}
+	if ret == nil {
+		t.Fatalf("expected a ReturnStmt among the top-level statements, got %v", stmts)
+	}
+	call, ok := ret.Value.(*ir.StaticMethodCall)
+	if !ok || call.Method != "log" || len(call.Args) != 1 {
+		t.Fatalf("expected the return value to be a call to \"log\" with 1 arg, got %#v", ret.Value)
+	}
+	field, ok := call.Args[0].(*ir.FieldAccess)
+	if !ok {
+		t.Fatalf("expected the call's argument to be a FieldAccess, got %#v", call.Args[0])
+	}
+	if field.Name != "field_4" {
+		t.Errorf("expected the field's name to be \"field_4\", got %q", field.Name)
+	}
+	obj, ok := field.Object.(*ir.LocalVar)
+	if !ok || obj.Name != "p" {
+		t.Errorf("expected the field's object to be local var \"p\", got %#v", field.Object)
+	}
+}
+
+// TestLiftFunction_PointerFieldStore lifts a hand-built instruction
+// stream equivalent to:
+//
+//	void set_field(Obj* p, int v) {
+//	    p->field_8 = v;
+//	}
+//
+// exercising a general (non-stack) memory store: a field write through
+// an arbitrary pointer parameter.
+func TestLiftFunction_PointerFieldStore(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// str w1, [x0, #8]    (p->field_8 = v)
+		{Address: 0x0, Size: 4, Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0", Disp: 8}},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "ret"},
+	}
+
+	stmts := LiftFunction(insns, []string{"p", "v"}, nil, nil)
+
+	var assign *ir.AssignStmt
+	for _, s := range stmts {
+		if v, ok := s.(*ir.AssignStmt); ok {
+			assign = v
+		}
+	}
+	if assign == nil {
+		t.Fatalf("expected an AssignStmt for \"p->field_8 = v\" among the top-level statements, got %v", stmts)
+	}
+	field, ok := assign.Target.(*ir.FieldAccess)
+	if !ok || field.Name != "field_8" {
+		t.Fatalf("expected the assignment's target to be a FieldAccess named \"field_8\", got %#v", assign.Target)
+	}
+	obj, ok := field.Object.(*ir.LocalVar)
+	if !ok || obj.Name != "p" {
+		t.Errorf("expected the field's object to be local var \"p\", got %#v", field.Object)
+	}
+	value, ok := assign.Value.(*ir.LocalVar)
+	if !ok || value.Name != "v" {
+		t.Errorf("expected the assignment's value to be local var \"v\", got %#v", assign.Value)
+	}
+}
+
+// TestLiftFunction_PointerFieldLoadPreservesUnusedCall lifts a
+// hand-built instruction stream equivalent to:
+//
+//	void f() {
+//	    void* p = malloc(8);
+//	    int unused = p->field_0;
+//	    other();
+//	}
+//
+// exercising why liftLdr's general (non-stack) case deliberately
+// leaves the pointer expression it reads unconsumed (see its own doc
+// comment): the loaded field is never itself used for anything, so the
+// FieldAccess wrapping malloc()'s result simply never appears in the
+// output - but malloc() itself must still show up somewhere, since a
+// real call's side effect can never be silently dropped just because
+// its result went unread. If liftLdr instead consumed the pointer
+// expression when building the FieldAccess, malloc() would vanish
+// entirely here.
+func TestLiftFunction_PointerFieldLoadPreservesUnusedCall(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// bl malloc(0x100)
+		{Address: 0x0, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// ldr w1, [x0, #0]    (loaded but never subsequently used)
+		{Address: 0x4, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0", Disp: 0}},
+		}},
+		// mov w0, #0 / mov w1, #0 - overwrite both residual argument
+		// registers with plain values first, so other() below picks up
+		// neither malloc()'s own pending result (still sitting in x0,
+		// untouched by the ldr above, which wrote to w1) nor the field
+		// access (in w1) as an IMPLICIT argument via buildCall's own
+		// "collect from x0 up to the first unassigned register"
+		// heuristic - which would otherwise incidentally keep both
+		// alive by embedding them as other()'s own arguments, and this
+		// test is specifically about neither being consumed by
+		// anything at all.
+		{Address: 0x8, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		{Address: 0xc, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		// bl other(0x104)
+		{Address: 0x10, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		{Address: 0x14, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "malloc", true
+		case 0x104:
+			return "other", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+
+	var haveMalloc, haveOther bool
+	for _, s := range stmts {
+		var call *ir.StaticMethodCall
+		switch v := s.(type) {
+		case *ir.ExprStmt:
+			call, _ = v.Expr.(*ir.StaticMethodCall)
+		case *ir.ReturnStmt:
+			// other()'s result flows straight into the return (it's the
+			// last thing computed before "ret"), rather than being
+			// flushed as its own ExprStmt - either way, it appears
+			// somewhere, which is all this test cares about.
+			call, _ = v.Value.(*ir.StaticMethodCall)
+		}
+		if call == nil {
+			continue
+		}
+		switch call.Method {
+		case "malloc":
+			haveMalloc = true
+		case "other":
+			haveOther = true
+		}
+	}
+	if !haveMalloc {
+		t.Errorf("expected malloc() to still appear as its own statement despite its result only ever being read through a field access that itself went unused, got %v", stmts)
+	}
+	if !haveOther {
+		t.Errorf("expected other() to appear somewhere among the top-level statements, got %v", stmts)
+	}
+}
