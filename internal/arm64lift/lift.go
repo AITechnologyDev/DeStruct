@@ -239,24 +239,42 @@ func LiftFunction(instructions []native.DetailedInstruction, paramNames []string
 	for _, b := range blocks {
 		byAddr[b.StartAddr] = b
 	}
-	return l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool))
+	return l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil)
 }
 
-// liftBlockGraph structurally reconstructs if/else from the CFG,
-// starting at block b, mirroring this project's JVM-side control-flow
-// reconstruction: a block ending in a conditional branch whose two
-// successors both eventually reach the same merge block becomes an
-// if/else; anything not matching that shape yet is lifted as a flat,
-// linear sequence (falls through to the next block without real
-// structural recovery) - narrower than the JVM side's matchers, but
-// enough for straight-line-with-one-branch functions like this
-// package's current test cases.
+// loopCtx identifies the innermost enclosing loop a liftBlockGraph
+// call is currently lifting code inside of, if any - headAddr/
+// exitAddr are that loop's own head/exit block addresses (see
+// tryLiftWhileLoop), which liftBlockGraph intercepts as continue/break
+// respectively rather than lifting them as ordinary blocks. nil means
+// "not inside any loop" (either at the function's top level, or
+// lifting the continuation that runs AFTER a loop, which resumes the
+// OUTER loop's own context - see tryLiftWhileLoop's own use of this).
+type loopCtx struct {
+	headAddr uint64
+	exitAddr uint64
+}
+
+// liftBlockGraph structurally reconstructs if/else and while loops
+// from the CFG, starting at block b, mirroring this project's
+// JVM-side control-flow reconstruction: a block ending in a
+// conditional branch whose two successors both eventually reach the
+// same merge block becomes an if/else (see tryLiftWhileLoop first,
+// though, for when one successor instead reaches back to the block
+// itself - a loop, not an if/else); anything not matching either shape
+// is lifted as a flat, linear sequence (falls through to the next
+// block without real structural recovery) - narrower than the JVM
+// side's matchers in some respects still (see the TODO at the bottom
+// of this file), but not in others: a loop body can freely contain its
+// own nested if/else, break/continue, or nested loops, all handled by
+// nothing more than this same function recursing into itself with
+// (possibly new) loop context - see loop's own doc comment.
 //
 // visited guards against revisiting a block already lifted along this
 // path (defensive - real -O0 code without loops shouldn't need it, but
 // prevents infinite recursion on unexpected/malformed input rather than
 // hanging).
-func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, visited map[uint64]bool) []ir.Stmt {
+func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) []ir.Stmt {
 	if b == nil || visited[b.StartAddr] {
 		return nil
 	}
@@ -303,33 +321,22 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 
 		thenAddr, elseAddr := b.Succs[0], b.Succs[1]
 
-		if loopStmts, ok := l.tryLiftWhileLoop(b, cond, thenAddr, elseAddr, byAddr, visited); ok {
+		if loopStmts, ok := l.tryLiftWhileLoop(b, cond, thenAddr, elseAddr, byAddr, visited, loop); ok {
 			return append(stmts, loopStmts...)
 		}
 
-		thenBlock, thenOk := byAddr[thenAddr]
-		elseBlock, elseOk := byAddr[elseAddr]
-
-		// Each branch gets its own copy of visited (not the shared map)
-		// - both branches may independently reach the same merge block
-		// (e.g. a shared epilogue both paths return through), and each
-		// needs to lift it with its OWN register state, not have the
-		// second arrival silently blocked because the first already
-		// visited it.
-		var thenStmts, elseStmts []ir.Stmt
-		if thenOk {
-			thenLifter := l.fork()
-			thenStmts = thenLifter.liftBlockGraph(thenBlock, byAddr, cloneVisited(visited))
-		}
-		if elseOk {
-			elseLifter := l.fork()
-			elseStmts = elseLifter.liftBlockGraph(elseBlock, byAddr, cloneVisited(visited))
-		}
-
+		// liftLoopEdge is what turns a branch straight to the
+		// innermost enclosing loop's own head/exit into an explicit
+		// continue/break, since this IS one arm of a genuine
+		// conditional split (the other arm does something different) -
+		// unlike the plain single-successor fallback below, where
+		// reaching head this way is simply "the body's done, naturally
+		// re-check the condition" and needs no statement at all. See
+		// its own doc comment.
 		stmts = append(stmts, &ir.IfStmt{
 			Cond: cond,
-			Then: &ir.Block{Statements: thenStmts},
-			Else: &ir.Block{Statements: elseStmts},
+			Then: &ir.Block{Statements: l.liftLoopEdge(thenAddr, byAddr, visited, loop)},
+			Else: &ir.Block{Statements: l.liftLoopEdge(elseAddr, byAddr, visited, loop)},
 		})
 		return stmts
 	}
@@ -338,8 +345,40 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 	// and continue into whichever single successor it has (if any).
 	stmts = append(stmts, l.run(b.Instructions)...)
 	if len(b.Succs) == 1 {
+		if loop != nil && b.Succs[0] == loop.exitAddr {
+			// An unconditional jump straight to the loop's own exit -
+			// a "break;" with no enclosing if (unusual, but valid: an
+			// unconditional break at the end of some straight-line
+			// stretch of the body, e.g. after every other case was
+			// already handled by an earlier conditional continue).
+			// Unlike reaching headAddr this same way (below), exitAddr
+			// is never where a loop body naturally ends up on its own,
+			// so this must always be explicit. Flushed first, same
+			// reasoning as the headAddr case below: this path doesn't
+			// reach liftBlockGraph's own "true leaf" flush either
+			// (exitAddr's block does exist in byAddr), so anything
+			// left pending here would otherwise vanish right before
+			// the break.
+			stmts = append(stmts, l.flushRemaining()...)
+			return append(stmts, &ir.BreakStmt{})
+		}
+		if loop != nil && b.Succs[0] == loop.headAddr {
+			// The natural end of this path within the loop body - it
+			// simply loops back to re-check the condition, needing no
+			// explicit statement (unlike exitAddr above: this IS where
+			// a body naturally ends up without any special source-level
+			// construct at all). head is always already visited by
+			// this point (see tryLiftWhileLoop, which lifts it before
+			// ever setting up this loop context), so recursing into it
+			// like the plain case below would just silently return nil
+			// without ever reaching what liftBlockGraph normally treats
+			// as a "true leaf" - meaning anything picked up along THIS
+			// path (a call whose result nothing here consumed) needs
+			// its own explicit flush right here, or it would vanish.
+			return append(stmts, l.flushRemaining()...)
+		}
 		if next, ok := byAddr[b.Succs[0]]; ok {
-			return append(stmts, l.liftBlockGraph(next, byAddr, visited)...)
+			return append(stmts, l.liftBlockGraph(next, byAddr, visited, loop)...)
 		}
 	}
 	// A true leaf: either this block has no successor at all, or its
@@ -351,72 +390,126 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 	return append(stmts, l.flushRemaining()...)
 }
 
-// findLoopBody walks the single-successor chain of ordinary
-// straight-line blocks starting at startAddr (no block in the chain
-// may itself end in a conditional branch - see this function's own
-// return for why), looking for it to eventually reach a block whose
-// sole successor is exactly headAddr - a genuine backward branch to
-// headAddr, since blocks are laid out in address order and an
-// ordinary forward/fallthrough successor could never reach back to an
-// earlier address. This is the only loop body shape this iteration of
-// the lifter recognizes: a plain "while (cond) { straight-line body }"
-// with no nested branching (an if, a break/continue, or a nested loop
-// inside the body) - see the TODO at the bottom of this file for
-// those. Returns the chain of blocks making up the body (NOT including
-// head itself), in execution order, and ok=true when found; (nil,
-// false) for anything else, including startAddr being headAddr itself
-// (a zero-block "loop" isn't this shape - most likely, headAddr was
-// reached via a chain of blocks that never actually branches backward
-// at all, i.e. this isn't a loop in the first place).
-func findLoopBody(startAddr, headAddr uint64, byAddr map[uint64]*BasicBlock) ([]*BasicBlock, bool) {
-	var chain []*BasicBlock
-	seen := make(map[uint64]bool)
-	addr := startAddr
-	for {
-		if addr == headAddr {
-			return nil, false
+// liftLoopEdge lifts one arm of an if/else split found while lifting
+// INSIDE a loop body (the thenAddr/elseAddr case in liftBlockGraph's
+// own if/else handling): reaching the innermost enclosing loop's own
+// head or exit this way is an explicit continue/break (this arm of
+// the branch does that; the other arm does something else - see
+// liftBlockGraph's own note on why the plain single-successor case is
+// different). Anything else is an ordinary nested block, lifted with
+// its own forked lifter and visited copy exactly like an ordinary
+// if/else branch (see liftBlockGraph's reasoning for why each side
+// needs its own fork: both branches may independently reach a shared
+// merge block, and each needs to lift it with its OWN register
+// state).
+func (l *lifter) liftLoopEdge(addr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) []ir.Stmt {
+	if loop != nil {
+		if addr == loop.headAddr {
+			return []ir.Stmt{&ir.ContinueStmt{}}
 		}
-		blk, ok := byAddr[addr]
-		if !ok || seen[addr] {
-			return nil, false
+		if addr == loop.exitAddr {
+			return []ir.Stmt{&ir.BreakStmt{}}
+		}
+	}
+	block, ok := byAddr[addr]
+	if !ok {
+		return nil
+	}
+	forked := l.fork()
+	return forked.liftBlockGraph(block, byAddr, cloneVisited(visited), loop)
+}
+
+// reachesAddr reports whether target is reachable from startAddr by
+// following successor edges through byAddr - a plain breadth-first
+// search over the CFG, used only to answer "does this path loop back
+// to the block we started from" (see tryLiftWhileLoop), not to lift
+// anything. Shares l.budget with liftBlockGraph's own visit count (see
+// its doc comment): a function whose if/else nesting is already eating
+// into the budget shouldn't ALSO get an unbounded amount of extra work
+// from every candidate loop shape trying two of these - exhausting the
+// budget here simply answers false (safe: the caller falls back to
+// treating the block as an ordinary if/else, never a crash or a hang).
+//
+// boundary, when non-nil, is the loop context ALREADY active where
+// this search began (tryLiftWhileLoop's own outerLoop) - reaching
+// boundary's own head or exit address stops that path from expanding
+// any further (though it's still checked against target first, same
+// as any other address). Without this, checking whether some inner
+// conditional's branch loops back to ITSELF would wrongly see right
+// through an ordinary continue/break for the ALREADY-active outer
+// loop (which, being an active loop, naturally cycles back through
+// its own body eventually) and conclude the inner branch loops back
+// to itself too - misreading a plain "if (x) continue;" nested inside
+// an outer loop as the head of a brand new (and nonexistent) loop of
+// its own.
+func (l *lifter) reachesAddr(startAddr, target uint64, byAddr map[uint64]*BasicBlock, boundary *loopCtx) bool {
+	seen := map[uint64]bool{}
+	queue := []uint64{startAddr}
+	for len(queue) > 0 {
+		if *l.budget <= 0 {
+			return false
+		}
+		*l.budget--
+		addr := queue[0]
+		queue = queue[1:]
+		if addr == target {
+			return true
+		}
+		if seen[addr] {
+			continue
 		}
 		seen[addr] = true
-		chain = append(chain, blk)
-		if blk.LastCond != nil || len(blk.Succs) != 1 {
-			return nil, false
+		if boundary != nil && (addr == boundary.headAddr || addr == boundary.exitAddr) {
+			continue
 		}
-		if blk.Succs[0] == headAddr {
-			return chain, true
+		if blk, ok := byAddr[addr]; ok {
+			queue = append(queue, blk.Succs...)
 		}
-		addr = blk.Succs[0]
 	}
+	return false
 }
 
 // tryLiftWhileLoop attempts to recognize head (a block ending in the
 // conditional branch already lifted into cond, with thenAddr/elseAddr
 // as its two successors - Succs[0]/Succs[1], per BasicBlock.Succs' own
 // doc comment) as the standard -O0 "while (cond) { body }" shape:
-// exactly one of the two successors leads, via findLoopBody's chain,
-// back to head itself (the loop body), while the other is what runs
-// after the loop exits. Returns ok=false (with stmts=nil) for any pair
-// that isn't this shape, so the caller (liftBlockGraph) falls back to
-// treating it as an ordinary if/else.
-func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, elseAddr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool) ([]ir.Stmt, bool) {
-	var chain []*BasicBlock
-	var exitAddr uint64
-	var whileCond ir.Expr
+// exactly one of the two successors can reach back to head itself by
+// SOME path (via reachesAddr - the body, which may freely contain its
+// own nested control flow, unlike a straight-line-only chain), while
+// the other cannot (what runs after the loop exits). If BOTH can (an
+// irregular shape, e.g. two independent back-edges converging) or
+// NEITHER can (not a loop at all), this returns ok=false so the caller
+// (liftBlockGraph) falls back to treating it as an ordinary if/else -
+// always a safe default, never a wrong guess.
+//
+// outerLoop is whatever loop context liftBlockGraph itself was already
+// lifting inside of (nil at the top level) - threaded through to the
+// exit continuation below (which resumes THAT context, not this loop's
+// own), so a break/continue appearing after this loop, but still
+// inside an enclosing one, still resolves correctly.
+func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, elseAddr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, outerLoop *loopCtx) ([]ir.Stmt, bool) {
+	thenLoops := l.reachesAddr(thenAddr, head.StartAddr, byAddr, outerLoop)
+	elseLoops := l.reachesAddr(elseAddr, head.StartAddr, byAddr, outerLoop)
 
-	if bodyChain, ok := findLoopBody(thenAddr, head.StartAddr, byAddr); ok {
+	var bodyAddr, exitAddr uint64
+	var whileCond ir.Expr
+	switch {
+	case thenLoops && !elseLoops:
 		// Branch-taken enters the body - cond (as lifted, for entering
 		// Succs[0] - see liftCondition's own doc comment) IS the
 		// while-condition as-is.
-		chain, exitAddr, whileCond = bodyChain, elseAddr, cond
-	} else if bodyChain, ok := findLoopBody(elseAddr, head.StartAddr, byAddr); ok {
+		bodyAddr, exitAddr, whileCond = thenAddr, elseAddr, cond
+	case elseLoops && !thenLoops:
 		// Fallthrough enters the body - the branch-taken path is the
 		// EXIT, so entering the body means the branch was NOT taken:
 		// the real while-condition is cond's negation.
-		chain, exitAddr, whileCond = bodyChain, thenAddr, &ir.UnaryExpr{Op: "!", Expr: cond}
-	} else {
+		bodyAddr, exitAddr, whileCond = elseAddr, thenAddr, &ir.UnaryExpr{Op: "!", Expr: cond}
+	default:
+		return nil, false
+	}
+
+	bodyBlock, ok := byAddr[bodyAddr]
+	if !ok {
 		return nil, false
 	}
 
@@ -427,32 +520,32 @@ func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, else
 	// (pre-loop) state - the simplest sound-enough approximation
 	// available without real per-iteration dataflow/fixpoint analysis
 	// of what's actually in each register after zero-or-more
-	// iterations.
+	// iterations. Recursing into liftBlockGraph itself (rather than a
+	// specialized straight-line-only walk) is what lets the body
+	// contain its own nested if/else or loops for free; the new
+	// loopCtx is what turns a path back to head, or out to exitAddr,
+	// into a continue/break instead of ordinary (or blocked-by-
+	// visited) control flow.
 	bodyLifter := l.fork()
-	var bodyStmts []ir.Stmt
-	for i, blk := range chain {
-		insns := blk.Instructions
-		if i == len(chain)-1 {
-			// The final block's own trailing branch back to head is
-			// the loop's back-edge itself, not source-level code -
-			// same reasoning as excluding head's own conditional
-			// branch from bodyInsns in liftBlockGraph.
-			insns = insns[:len(insns)-1]
-		}
-		bodyStmts = append(bodyStmts, bodyLifter.run(insns)...)
-	}
+	bodyStmts := bodyLifter.liftBlockGraph(bodyBlock, byAddr, cloneVisited(visited), &loopCtx{headAddr: head.StartAddr, exitAddr: exitAddr})
+	// The body's natural end (reaching head again via the plain
+	// single-successor path - see liftBlockGraph's own note on why
+	// that's implicit, unlike an explicit continue) is NOT treated as
+	// a leaf by liftBlockGraph's own leaf-flush logic (head's block
+	// technically exists in byAddr - recursing into it just returns
+	// nil because it's already visited, not because there's no
+	// successor at all) - so any call the body's own top-level
+	// straight-line run left unconsumed still needs flushing here,
+	// exactly like LiftFunction/liftBlockGraph do at every OTHER real
+	// leaf. Harmless (a no-op) when the body's own internal recursion
+	// already flushed everything itself - e.g. a body that's an
+	// if/else at its own top level already flushes its own bodyInsns
+	// before splitting (see liftBlockGraph's if/else case).
 	bodyStmts = append(bodyStmts, bodyLifter.flushRemaining()...)
-
-	// The body chain is now fully accounted for - mark it visited in
-	// the PARENT's own map (not just the fork's) so the exit
-	// continuation below can't wander back into it.
-	for _, blk := range chain {
-		visited[blk.StartAddr] = true
-	}
 
 	stmts := []ir.Stmt{&ir.WhileStmt{Cond: whileCond, Body: &ir.Block{Statements: bodyStmts}}}
 	if exitBlock, ok := byAddr[exitAddr]; ok {
-		stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited)...)
+		stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited, outerLoop)...)
 	}
 	return stmts, true
 }
@@ -1597,24 +1690,25 @@ func (l *lifter) liftRet() ir.Stmt {
 
 // TODO(next iterations): calls, comparisons/if-else, generic mov,
 // void-call statement emission, adrp/adr string-literal resolution,
-// ldr-through-GOT global-object resolution, plain single-condition
-// "while (cond) { straight-line body }" loops (cmp+b.cond, cbz/cbnz,
-// or tbz/tbnz), and more ALU/shift ops (sub/and/orr/eor/mul/lsl/lsr/
-// asr) are now handled (see liftCall/liftMov/flushRemaining, liftAddr/
-// buildCall's StringResolver use, liftLdr's addrRegs+resolver use with
-// ELFParser.ResolveGOT, tryLiftWhileLoop/findLoopBody, and liftALU).
-// Remaining growth areas, roughly in order of how often real-world -O0
-// code needs them:
-//   - Loop bodies containing their own nested control flow (an if, a
-//     break/continue, a nested loop) - findLoopBody currently bails
-//     out the instant any block in the candidate body chain has its
-//     own conditional branch. Also unhandled: compound (&&/||)
-//     while-conditions, which compile to MULTIPLE chained
-//     conditional-branch blocks (each able to exit the loop) rather
-//     than a single one - and do/for-shaped back-edges where the
-//     condition check is the LAST block of the body rather than the
-//     first (this iteration only recognizes the condition-first
-//     "while" shape).
+// ldr-through-GOT global-object resolution, "while (cond) { body }"
+// loops (cmp+b.cond, cbz/cbnz, or tbz/tbnz) INCLUDING bodies with their
+// own nested if/else, break/continue, or nested loops, and more
+// ALU/shift ops (sub/and/orr/eor/mul/lsl/lsr/asr) are now handled (see
+// liftCall/liftMov/flushRemaining, liftAddr/buildCall's StringResolver
+// use, liftLdr's addrRegs+resolver use with ELFParser.ResolveGOT,
+// tryLiftWhileLoop/reachesAddr/liftLoopEdge, and liftALU). Remaining
+// growth areas, roughly in order of how often real-world -O0 code
+// needs them:
+//   - Compound (&&/||) while-conditions, which compile to MULTIPLE
+//     chained conditional-branch blocks (each able to exit the loop)
+//     rather than a single one - tryLiftWhileLoop only ever looks at
+//     ONE block's own condition.
+//   - do/for-shaped back-edges where the condition check is the LAST
+//     block of the body rather than the first (this iteration only
+//     recognizes the condition-first "while" shape - reachesAddr asks
+//     "does the head's OWN successor loop back to the head", which a
+//     do-while's back-edge, pointing at the body's start rather than
+//     the tail condition's own address, doesn't match).
 //   - Non-parameter stack locals (regular local variables, not just
 //     spilled parameters), and loads/stores to non-stack memory (real
 //     pointer dereferences, not just the stack-slot bookkeeping this

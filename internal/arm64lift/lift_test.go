@@ -382,3 +382,182 @@ func TestLiftFunction_ALUOps(t *testing.T) {
 		t.Errorf("expected the \"-\" right side to be param \"b\", got %#v", sub.Right)
 	}
 }
+
+// TestLiftFunction_LoopWithNestedIf lifts a hand-built instruction
+// stream equivalent to:
+//
+//	while (w0 != 0) {
+//	    if (w1 != 0) {
+//	        continue;
+//	    } else {
+//	        step();
+//	    }
+//	}
+//
+// exercising a loop body containing its own nested if/continue -
+// previously (findLoopBody's straight-chain-only walk) this shape
+// wasn't recognized as a loop at all; it now reuses liftBlockGraph
+// itself for the body, with loopCtx turning the branch back to head
+// into an explicit ContinueStmt. The lifter has no "un-nest code after
+// an early continue" beautification pass, so step() lands nested
+// inside the if's else-branch rather than flattened after a guard
+// clause - a different (still fully correct) shape than a human would
+// typically write by hand, not a bug.
+func TestLiftFunction_LoopWithNestedIf(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// head @ 0x0: cbz w0, exit(0x10)
+		{Address: 0x0, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0x10},
+		}},
+		// @ 0x4: cbnz w1, head(0x0)   (if (w1 != 0) continue;)
+		{Address: 0x4, Size: 4, Mnemonic: "cbnz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandImm, Imm: 0x0},
+		}},
+		// @ 0x8: bl step(0x100)
+		{Address: 0x8, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// @ 0xc: b head(0x0)
+		{Address: 0xc, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x0},
+		}},
+		// exit @ 0x10: ret
+		{Address: 0x10, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+
+	var while *ir.WhileStmt
+	for _, s := range stmts {
+		if w, ok := s.(*ir.WhileStmt); ok {
+			while = w
+		}
+	}
+	if while == nil {
+		t.Fatalf("expected a WhileStmt among the top-level statements, got %v", stmts)
+	}
+	if while.Body == nil || len(while.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the loop body (the nested if), got %v", while.Body)
+	}
+
+	ifStmt, ok := while.Body.Statements[0].(*ir.IfStmt)
+	if !ok {
+		t.Fatalf("expected the body statement to be an IfStmt, got %T: %v", while.Body.Statements[0], while.Body.Statements[0])
+	}
+	if ifStmt.Then == nil || len(ifStmt.Then.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the if's then-branch, got %v", ifStmt.Then)
+	}
+	if _, ok := ifStmt.Then.Statements[0].(*ir.ContinueStmt); !ok {
+		t.Errorf("expected the if's then-branch to be a ContinueStmt, got %T: %v", ifStmt.Then.Statements[0], ifStmt.Then.Statements[0])
+	}
+
+	if ifStmt.Else == nil || len(ifStmt.Else.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the if's else-branch (the flushed step() call - next()'s result is never consumed by anything, so it doesn't appear as its own statement), got %v", ifStmt.Else)
+	}
+	exprStmt, ok := ifStmt.Else.Statements[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the else-branch's statement to be an ExprStmt, got %T: %v", ifStmt.Else.Statements[0], ifStmt.Else.Statements[0])
+	}
+	if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected a call to \"step\", got %#v", exprStmt.Expr)
+	}
+}
+
+// TestLiftFunction_LoopWithUnconditionalBreak lifts a hand-built
+// instruction stream equivalent to:
+//
+//	while (w0 != 0) {
+//	    if (w1 != 0) {
+//	        continue;
+//	    } else {
+//	        step();
+//	        break;
+//	    }
+//	}
+//
+// exercising an UNCONDITIONAL break (a plain "b" straight to the
+// loop's exit, no enclosing if of its own - unlike the continue case,
+// which liftLoopEdge handles directly at an if/else split, this one is
+// only reachable through liftBlockGraph's plain single-successor
+// fallback) - and specifically that step()'s call result is still
+// flushed before the break, rather than silently dropped right before
+// it (a real gap this test was written to catch).
+func TestLiftFunction_LoopWithUnconditionalBreak(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// head @ 0x0: cbz w0, exit(0x14)
+		{Address: 0x0, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// @ 0x4: cbnz w1, head(0x0)   (if (w1 != 0) continue;)
+		{Address: 0x4, Size: 4, Mnemonic: "cbnz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandImm, Imm: 0x0},
+		}},
+		// @ 0x8: bl step(0x100)
+		{Address: 0x8, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// @ 0xc: b exit(0x14)   (unconditional break)
+		{Address: 0xc, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// exit @ 0x14: ret
+		{Address: 0x14, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+
+	var while *ir.WhileStmt
+	for _, s := range stmts {
+		if w, ok := s.(*ir.WhileStmt); ok {
+			while = w
+		}
+	}
+	if while == nil {
+		t.Fatalf("expected a WhileStmt among the top-level statements, got %v", stmts)
+	}
+	if while.Body == nil || len(while.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the loop body (the nested if), got %v", while.Body)
+	}
+	ifStmt, ok := while.Body.Statements[0].(*ir.IfStmt)
+	if !ok {
+		t.Fatalf("expected the body statement to be an IfStmt, got %T: %v", while.Body.Statements[0], while.Body.Statements[0])
+	}
+	if ifStmt.Then == nil || len(ifStmt.Then.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the if's then-branch, got %v", ifStmt.Then)
+	}
+	if _, ok := ifStmt.Then.Statements[0].(*ir.ContinueStmt); !ok {
+		t.Errorf("expected the if's then-branch to be a ContinueStmt, got %T: %v", ifStmt.Then.Statements[0], ifStmt.Then.Statements[0])
+	}
+
+	if ifStmt.Else == nil || len(ifStmt.Else.Statements) != 2 {
+		t.Fatalf("expected exactly 2 statements in the if's else-branch (the flushed step() call, then the break), got %v", ifStmt.Else)
+	}
+	exprStmt, ok := ifStmt.Else.Statements[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the else-branch's first statement to be an ExprStmt, got %T: %v", ifStmt.Else.Statements[0], ifStmt.Else.Statements[0])
+	}
+	if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected a call to \"step\", got %#v", exprStmt.Expr)
+	}
+	if _, ok := ifStmt.Else.Statements[1].(*ir.BreakStmt); !ok {
+		t.Errorf("expected the else-branch's second statement to be a BreakStmt, got %T: %v", ifStmt.Else.Statements[1], ifStmt.Else.Statements[1])
+	}
+}
