@@ -336,8 +336,9 @@ func (sa *SmartAssembler) PatchFile(inputPath, hasmPath, outputPath string) erro
 		}
 
 		// Update function bytecode
-		hbc.FunctionHeaders[funcIdx].BytecodeSizeInBytes = uint32(len(newBytecode))
-		hbc.SetCode(funcIdx, newBytecode)
+		if err := hbc.SetCode(funcIdx, newBytecode); err != nil {
+			return fmt.Errorf("setting bytecode for function %d: %v", funcIdx, err)
+		}
 	}
 
 	// Write patched file

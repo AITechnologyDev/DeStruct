@@ -1061,27 +1061,71 @@ func (f *HBCFile) getCode(funcIdx int) []byte {
 	return f.rawData[offset : offset+size]
 }
 
-// SetCode replaces the bytecode for a function
-func (f *HBCFile) SetCode(funcIdx int, newCode []byte) {
-	if funcIdx >= len(f.FunctionHeaders) {
-		return
+// SetCode replaces the bytecode for a function, splicing f.rawData and
+// re-serializing every function header (and the file-level header) that the
+// resulting size change affects - the same bookkeeping
+// HermesDecAssembler.patchOneFunction performs, since a naive splice would
+// leave the on-disk header table pointing at stale offsets/sizes the moment
+// newCode's length differs from the function's current bytecode.
+func (f *HBCFile) SetCode(funcIdx int, newCode []byte) error {
+	if funcIdx < 0 || funcIdx >= len(f.FunctionHeaders) {
+		return fmt.Errorf("function index %d out of range", funcIdx)
 	}
 	hdr := &f.FunctionHeaders[funcIdx]
 	offset := int(hdr.Offset)
-	size := int(hdr.BytecodeSizeInBytes)
+	oldSize := int(hdr.BytecodeSizeInBytes)
+	if offset < 0 || offset+oldSize > len(f.rawData) {
+		return fmt.Errorf("function's current bytecode range [%d, %d) is out of bounds for a %d-byte file", offset, offset+oldSize, len(f.rawData))
+	}
 
-	// Replace in rawData
-	newData := make([]byte, len(f.rawData)-size+len(newCode))
+	// splicePoint mirrors patchOneFunction's: everything at or after the
+	// end of the OLD bytecode shifts by delta, including header tables
+	// (large/overflow headers) that live past the whole bytecode segment.
+	splicePoint := int64(offset + oldSize)
+
+	newData := make([]byte, len(f.rawData)-oldSize+len(newCode))
 	copy(newData, f.rawData[:offset])
 	copy(newData[offset:], newCode)
-	copy(newData[offset+len(newCode):], f.rawData[offset+size:])
-
+	copy(newData[offset+len(newCode):], f.rawData[offset+oldSize:])
 	f.rawData = newData
 
-	// Update all function offsets after this one
-	for i := funcIdx + 1; i < len(f.FunctionHeaders); i++ {
-		f.FunctionHeaders[i].Offset += uint32(len(newCode) - size)
+	delta := len(newCode) - oldSize
+	hdr.BytecodeSizeInBytes = uint32(len(newCode))
+
+	if delta != 0 {
+		for i := range f.FunctionHeaders {
+			h := &f.FunctionHeaders[i]
+			if i != funcIdx && int64(h.Offset) >= splicePoint {
+				h.Offset = uint32(int64(h.Offset) + int64(delta))
+			}
+			if h.Overflowed && h.LargeHeaderFileOffset >= splicePoint {
+				h.LargeHeaderFileOffset += int64(delta)
+			}
+			if h.SmallHeaderFileOffset >= splicePoint {
+				h.SmallHeaderFileOffset += int64(delta)
+			}
+		}
 	}
+
+	if err := f.writeFunctionHeaderOffsetAndSize(funcIdx); err != nil {
+		return fmt.Errorf("writing updated header for function #%d: %w", funcIdx, err)
+	}
+	if delta != 0 {
+		for i := range f.FunctionHeaders {
+			if i == funcIdx {
+				continue
+			}
+			if err := f.writeFunctionHeaderOffsetAndSize(i); err != nil {
+				return fmt.Errorf("writing updated header for function #%d: %w", i, err)
+			}
+		}
+
+		f.Header.DebugInfoOffset = uint32(int64(f.Header.DebugInfoOffset) + int64(delta))
+		f.Header.FileLength = uint32(int64(f.Header.FileLength) + int64(delta))
+		f.writeHeaderFields()
+	}
+
+	return nil
 }
 
 // Write writes the HBC file to disk with recalculated SHA1
