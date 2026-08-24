@@ -136,21 +136,26 @@ func branchTarget(inst native.DetailedInstruction) (uint64, bool) {
 	if !isAnyBranch(inst) {
 		return 0, false
 	}
-	if len(inst.Operands) == 0 || inst.Operands[0].Type != native.OperandImm {
+	if len(inst.Operands) == 0 {
 		return 0, false
 	}
-	return uint64(inst.Operands[0].Imm), true
+	// The target is always the LAST operand: "b"/"b.cond" have exactly
+	// one (the target itself), while "cbz"/"cbnz" put it after the
+	// tested register ("cbz Rt, #target").
+	last := inst.Operands[len(inst.Operands)-1]
+	if last.Type != native.OperandImm {
+		return 0, false
+	}
+	return uint64(last.Imm), true
 }
 
 // isAnyBranch reports whether inst is any kind of direct branch this
 // lifter currently recognizes as ending a basic block: unconditional
-// "b", or a conditional "b.cond" (Capstone spells the mnemonic itself
-// as "b.eq", "b.le", "b.gt", etc. - the condition is part of the
-// mnemonic string, not a separate operand). "bl" (call) deliberately
-// does NOT end a block here - a call returns control to the next
-// instruction, so it doesn't change the function's own control flow the
-// way a real branch does; see the TODO at the bottom of lift.go for
-// when calls themselves get lifted.
+// "b", or a conditional one (see isConditionalBranch). "bl" (call)
+// deliberately does NOT end a block here - a call returns control to
+// the next instruction, so it doesn't change the function's own
+// control flow the way a real branch does; see the TODO at the bottom
+// of lift.go for when calls themselves get lifted.
 func isAnyBranch(inst native.DetailedInstruction) bool {
 	if inst.Mnemonic == "b" {
 		return true
@@ -158,12 +163,20 @@ func isAnyBranch(inst native.DetailedInstruction) bool {
 	return isConditionalBranch(inst)
 }
 
-// isConditionalBranch reports whether inst is a conditional branch
-// (b.eq, b.ne, b.le, b.gt, b.lt, b.ge, ...) - recognized by mnemonic
-// prefix, since Capstone folds the ARM64 condition code into the
-// mnemonic string itself rather than exposing it as a separate operand
-// or field.
+// isConditionalBranch reports whether inst is a conditional branch:
+// either "b.cond" (Capstone folds the ARM64 condition code into the
+// mnemonic string itself, as "b.eq", "b.le", "b.gt", ... - not a
+// separate operand or field), or "cbz"/"cbnz" (branch if a register
+// is/isn't zero - the single most common -O0 idiom for a null/zero
+// check or a simple loop counter test, compiled directly from the
+// comparison rather than via a separate "cmp" - see liftCondition's
+// own handling of these two). "tbz"/"tbnz" (test a single bit) are
+// NOT yet recognized - see the TODO at the bottom of this file.
 func isConditionalBranch(inst native.DetailedInstruction) bool {
+	switch inst.Mnemonic {
+	case "cbz", "cbnz":
+		return true
+	}
 	return len(inst.Mnemonic) > 2 && inst.Mnemonic[0] == 'b' && inst.Mnemonic[1] == '.'
 }
 
@@ -193,6 +206,7 @@ type StringResolver func(addr uint64) (s string, ok bool)
 // nil, in which case a computed data address is rendered as a raw
 // number rather than resolved text.
 func LiftFunction(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver) []ir.Stmt {
+	budget := blockVisitBudget
 	l := &lifter{
 		regs:     make(map[string]ir.Expr),
 		stack:    make(map[int32]string),
@@ -201,6 +215,7 @@ func LiftFunction(instructions []native.DetailedInstruction, paramNames []string
 		strings:  strResolver,
 		addrRegs: make(map[string]uint64),
 		consumed: make(map[ir.Expr]bool),
+		budget:   &budget,
 	}
 	l.seedParams()
 
@@ -242,6 +257,15 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 	if b == nil || visited[b.StartAddr] {
 		return nil
 	}
+	// See lifter.budget's own doc comment: this bounds the exponential
+	// blowup an if/else split with no merge-point sharing is otherwise
+	// prone to. Once exhausted, every further call becomes this same
+	// O(1) early return, so recursion actually stops quickly rather
+	// than merely slowing down.
+	if *l.budget <= 0 {
+		return nil
+	}
+	*l.budget--
 	visited[b.StartAddr] = true
 
 	var stmts []ir.Stmt
@@ -253,20 +277,33 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 		bodyInsns := b.Instructions[:len(b.Instructions)-1]
 		stmts = append(stmts, l.run(bodyInsns)...)
 
-		// The branch condition itself only ever reads l.lastCmp (already
-		// marked consumed by liftCmp, as part of running bodyInsns
-		// above) - anything else this straight-line prefix produced but
-		// left unconsumed can never be reached by name from inside
-		// EITHER fork below (each gets its own copy of consumed from
-		// this point on - see fork's own doc comment), so it must be
-		// flushed here, once, in the parent, before the split - not
-		// left for one or both forks to (incorrectly, redundantly)
-		// flush independently.
-		stmts = append(stmts, l.flushRemaining()...)
-
+		// liftCondition must run BEFORE flushRemaining: a b.cond's
+		// operands were already consumed earlier, while running
+		// bodyInsns's own "cmp" (so calling it here is a no-op change
+		// to consumed either way) - but a cbz/cbnz's tested register is
+		// only ever consumed by liftCondition itself (see its own doc
+		// comment), and that consumption must land before
+		// flushRemaining runs, or a register still holding an
+		// unconsumed call result at exactly this point would get
+		// flushed as its own spurious statement here and THEN embedded
+		// a second time into cond below.
 		cond := l.liftCondition(*b.LastCond)
 
+		// Anything else this straight-line prefix produced but left
+		// unconsumed (by cond above, or by anything else) can never be
+		// reached by name from inside EITHER fork below (each gets its
+		// own copy of consumed from this point on - see fork's own doc
+		// comment), so it must be flushed here, once, in the parent,
+		// before the split - not left for one or both forks to
+		// (incorrectly, redundantly) flush independently.
+		stmts = append(stmts, l.flushRemaining()...)
+
 		thenAddr, elseAddr := b.Succs[0], b.Succs[1]
+
+		if loopStmts, ok := l.tryLiftWhileLoop(b, cond, thenAddr, elseAddr, byAddr, visited); ok {
+			return append(stmts, loopStmts...)
+		}
+
 		thenBlock, thenOk := byAddr[thenAddr]
 		elseBlock, elseOk := byAddr[elseAddr]
 
@@ -311,6 +348,112 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 	return append(stmts, l.flushRemaining()...)
 }
 
+// findLoopBody walks the single-successor chain of ordinary
+// straight-line blocks starting at startAddr (no block in the chain
+// may itself end in a conditional branch - see this function's own
+// return for why), looking for it to eventually reach a block whose
+// sole successor is exactly headAddr - a genuine backward branch to
+// headAddr, since blocks are laid out in address order and an
+// ordinary forward/fallthrough successor could never reach back to an
+// earlier address. This is the only loop body shape this iteration of
+// the lifter recognizes: a plain "while (cond) { straight-line body }"
+// with no nested branching (an if, a break/continue, or a nested loop
+// inside the body) - see the TODO at the bottom of this file for
+// those. Returns the chain of blocks making up the body (NOT including
+// head itself), in execution order, and ok=true when found; (nil,
+// false) for anything else, including startAddr being headAddr itself
+// (a zero-block "loop" isn't this shape - most likely, headAddr was
+// reached via a chain of blocks that never actually branches backward
+// at all, i.e. this isn't a loop in the first place).
+func findLoopBody(startAddr, headAddr uint64, byAddr map[uint64]*BasicBlock) ([]*BasicBlock, bool) {
+	var chain []*BasicBlock
+	seen := make(map[uint64]bool)
+	addr := startAddr
+	for {
+		if addr == headAddr {
+			return nil, false
+		}
+		blk, ok := byAddr[addr]
+		if !ok || seen[addr] {
+			return nil, false
+		}
+		seen[addr] = true
+		chain = append(chain, blk)
+		if blk.LastCond != nil || len(blk.Succs) != 1 {
+			return nil, false
+		}
+		if blk.Succs[0] == headAddr {
+			return chain, true
+		}
+		addr = blk.Succs[0]
+	}
+}
+
+// tryLiftWhileLoop attempts to recognize head (a block ending in the
+// conditional branch already lifted into cond, with thenAddr/elseAddr
+// as its two successors - Succs[0]/Succs[1], per BasicBlock.Succs' own
+// doc comment) as the standard -O0 "while (cond) { body }" shape:
+// exactly one of the two successors leads, via findLoopBody's chain,
+// back to head itself (the loop body), while the other is what runs
+// after the loop exits. Returns ok=false (with stmts=nil) for any pair
+// that isn't this shape, so the caller (liftBlockGraph) falls back to
+// treating it as an ordinary if/else.
+func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, elseAddr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool) ([]ir.Stmt, bool) {
+	var chain []*BasicBlock
+	var exitAddr uint64
+	var whileCond ir.Expr
+
+	if bodyChain, ok := findLoopBody(thenAddr, head.StartAddr, byAddr); ok {
+		// Branch-taken enters the body - cond (as lifted, for entering
+		// Succs[0] - see liftCondition's own doc comment) IS the
+		// while-condition as-is.
+		chain, exitAddr, whileCond = bodyChain, elseAddr, cond
+	} else if bodyChain, ok := findLoopBody(elseAddr, head.StartAddr, byAddr); ok {
+		// Fallthrough enters the body - the branch-taken path is the
+		// EXIT, so entering the body means the branch was NOT taken:
+		// the real while-condition is cond's negation.
+		chain, exitAddr, whileCond = bodyChain, thenAddr, &ir.UnaryExpr{Op: "!", Expr: cond}
+	} else {
+		return nil, false
+	}
+
+	// The body is lifted with its own forked lifter, exactly like an
+	// if/else branch (see liftBlockGraph's own reasoning): its
+	// register writes are per-iteration state that must not leak into
+	// what runs after the loop, which continues below from head's OWN
+	// (pre-loop) state - the simplest sound-enough approximation
+	// available without real per-iteration dataflow/fixpoint analysis
+	// of what's actually in each register after zero-or-more
+	// iterations.
+	bodyLifter := l.fork()
+	var bodyStmts []ir.Stmt
+	for i, blk := range chain {
+		insns := blk.Instructions
+		if i == len(chain)-1 {
+			// The final block's own trailing branch back to head is
+			// the loop's back-edge itself, not source-level code -
+			// same reasoning as excluding head's own conditional
+			// branch from bodyInsns in liftBlockGraph.
+			insns = insns[:len(insns)-1]
+		}
+		bodyStmts = append(bodyStmts, bodyLifter.run(insns)...)
+	}
+	bodyStmts = append(bodyStmts, bodyLifter.flushRemaining()...)
+
+	// The body chain is now fully accounted for - mark it visited in
+	// the PARENT's own map (not just the fork's) so the exit
+	// continuation below can't wander back into it.
+	for _, blk := range chain {
+		visited[blk.StartAddr] = true
+	}
+
+	stmts := []ir.Stmt{&ir.WhileStmt{Cond: whileCond, Body: &ir.Block{Statements: bodyStmts}}}
+	if exitBlock, ok := byAddr[exitAddr]; ok {
+		stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited)...)
+	}
+	return stmts, true
+}
+
 // fork returns a new lifter that inherits this lifter's current
 // register/stack state as of the branch point, but can diverge from it
 // independently - needed because the then/else branches of an if
@@ -350,29 +493,48 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, budget: l.budget}
 }
 
-// liftCondition lifts a b.cond instruction into the IR condition
-// expression for entering the BRANCH-TAKEN path (Succs[0] - see
-// BasicBlock.Succs' doc comment) - i.e. the condition as the b.cond
-// instruction's own mnemonic states it, not inverted. This mirrors how
-// this project's JVM-side buildCondition works: the raw branch
-// instruction's condition is what's true when the branch is taken:
-// building the caller's if/else around Succs[0]-as-then means using
-// that condition directly, with no extra negation needed (unlike a few
-// of the JVM-side matchers, which build a condition for entering an
-// ordinary if's THEN when the underlying bytecode branch jumps AWAY
-// from it - ARM64's b.cond jumping TOWARD the branch-taken block is the
-// more direct case).
-//
-// The comparison operands come from whatever "cmp" instruction most
-// recently ran before this branch (ARM64 conditional branches always
-// test flags set by an earlier instruction, never their own operands
-// directly) - liftCondition relies on l.lastCmp having been populated
-// by run() while lifting that cmp, which is why liftBlockGraph lifts a
-// block's body (including its own trailing cmp) before calling this.
+// liftCondition lifts a conditional branch instruction (b.cond or
+// cbz/cbnz) into the IR condition expression for entering the
+// BRANCH-TAKEN path (Succs[0] - see BasicBlock.Succs' doc comment) -
+// i.e. the condition as the instruction's own mnemonic states it, not
+// inverted. This mirrors how this project's JVM-side buildCondition
+// works: the raw branch instruction's condition is what's true when
+// the branch is taken: building the caller's if/else around
+// Succs[0]-as-then means using that condition directly, with no extra
+// negation needed (unlike a few of the JVM-side matchers, which build
+// a condition for entering an ordinary if's THEN when the underlying
+// bytecode branch jumps AWAY from it - ARM64's conditional branches
+// jumping TOWARD the branch-taken block is the more direct case).
 func (l *lifter) liftCondition(inst native.DetailedInstruction) ir.Expr {
+	switch inst.Mnemonic {
+	case "cbz", "cbnz":
+		// Unlike b.cond, cbz/cbnz test their OWN register operand
+		// directly against zero - there's no preceding "cmp" to read
+		// (see cmpOperands' own doc comment for why b.cond needs one
+		// and this doesn't).
+		if len(inst.Operands) == 0 || inst.Operands[0].Type != native.OperandReg {
+			return &ir.LocalVar{Name: "cond"}
+		}
+		val := l.regValue(inst.Operands[0].Reg)
+		l.consume(val)
+		op := "=="
+		if inst.Mnemonic == "cbnz" {
+			op = "!="
+		}
+		return &ir.BinaryExpr{Op: op, Left: val, Right: &ir.IntLit{Value: 0}}
+	}
+
+	// b.cond: the comparison operands come from whatever "cmp"
+	// instruction most recently ran before this branch (ARM64's
+	// cmp-based conditional branches always test flags set by an
+	// earlier instruction, never carry their own operands) -
+	// liftCondition relies on l.lastCmp having been populated by run()
+	// while lifting that cmp, which is why liftBlockGraph lifts a
+	// block's body (including its own trailing cmp) before calling
+	// this.
 	op := condOpFromMnemonic(inst.Mnemonic)
 	if l.lastCmp == nil {
 		// No preceding cmp was lifted (e.g. this branch tests flags
@@ -404,6 +566,24 @@ func condOpFromMnemonic(mnemonic string) string {
 		return ">"
 	case "b.ge":
 		return ">="
+	case "b.hs":
+		// Unsigned "higher or same" (carry set) - the unsigned
+		// counterpart of b.ge, from an unsigned "cmp" (e.g. comparing
+		// two size_t/pointer values, or after an unsigned-widening
+		// load) rather than a signed one. This project's IR has no
+		// separate unsigned comparison operator, so ">=" is used as-is
+		// - correct for the common case where both operands are
+		// already known non-negative (unsigned types), imprecise only
+		// if one is a genuinely negative signed value reinterpreted as
+		// unsigned, which -O0 code testing size_t/pointer values (by
+		// far the common case for b.hs/b.lo/b.hi/b.ls) doesn't do.
+		return ">="
+	case "b.lo":
+		return "<" // unsigned "lower" (carry clear) - see b.hs's own note.
+	case "b.hi":
+		return ">" // unsigned "higher" - see b.hs's own note.
+	case "b.ls":
+		return "<=" // unsigned "lower or same" - see b.hs's own note.
 	default:
 		return "?"
 	}
@@ -476,6 +656,22 @@ type lifter struct {
 	// flushed as their own statement - either way, "already accounted
 	// for" and exempt from being flushed again.
 	consumed map[ir.Expr]bool
+
+	// budget bounds the total number of liftBlockGraph calls across
+	// THIS lifter and every one it's ever been forked from (a pointer,
+	// so fork() shares the same underlying counter rather than copying
+	// it - see fork's own doc comment) - a hard cap against the
+	// exponential blowup an if/else split with no merge-point sharing
+	// is inherently prone to: each nested conditional independently
+	// forks and re-traverses everything downstream of it on BOTH
+	// branches, so a long chain of N nested ifs (not unusual once
+	// cbz/cbnz are recognized as conditional branches too - see
+	// isConditionalBranch) does O(2^N) total block visits with no
+	// bound otherwise. Once exhausted, liftBlockGraph stops recursing
+	// and returns what it has so far for that path - an incomplete but
+	// bounded-time result beats hanging indefinitely on a real,
+	// large -O0 function.
+	budget *int
 }
 
 // cmpOperands is the lhs/rhs of a lifted "cmp" instruction, in the
@@ -485,6 +681,14 @@ type lifter struct {
 type cmpOperands struct {
 	lhs, rhs ir.Expr
 }
+
+// blockVisitBudget is the total number of liftBlockGraph calls allowed
+// across one entire LiftFunction call (all forks combined) - see the
+// lifter.budget field's own doc comment for why this cap exists at
+// all. 20000 is generous for any real single function's actual block
+// count (typically at most a few hundred) while still keeping even a
+// worst-case pathological blowup bounded to a fraction of a second.
+const blockVisitBudget = 20000
 
 // aapcs64IntArgRegs lists the integer/pointer argument registers in
 // AAPCS64 (ARM64 procedure call standard) order - the Nth entry is
@@ -1224,15 +1428,32 @@ func (l *lifter) liftRet() ir.Stmt {
 	return &ir.ReturnStmt{Value: val}
 }
 
-// TODO(next iterations): calls, comparisons/if-else, generic mov, and
-// void-call statement emission are now handled (see liftCall/liftMov/
-// flushRemaining and liftBlockGraph). Remaining growth areas, roughly
-// in order of how often real-world -O0 code needs them: adrp/adr and
-// immediate-operand arithmetic (add Rd, Rn, #imm) for computing
-// string-literal/global addresses (needs a memory-reader callback
-// alongside SymbolResolver to actually render the literal), more ALU
-// ops (sub/mul/and/orr/eor/...), loops (while/for - buildCFG only
-// structurally recognizes if/else so far), non-parameter stack locals
-// (regular local variables, not just spilled parameters), and loads/
-// stores to non-stack memory (real pointer dereferences, not just the
-// stack-slot bookkeeping this version does).
+// TODO(next iterations): calls, comparisons/if-else, generic mov,
+// void-call statement emission, adrp/adr string-literal resolution,
+// and plain single-condition "while (cond) { straight-line body }"
+// loops (cmp+b.cond or cbz/cbnz) are now handled (see liftCall/
+// liftMov/flushRemaining, liftAddr/buildCall's StringResolver use, and
+// tryLiftWhileLoop/findLoopBody). Remaining growth areas, roughly in
+// order of how often real-world -O0 code needs them:
+//   - Loop bodies containing their own nested control flow (an if, a
+//     break/continue, a nested loop) - findLoopBody currently bails
+//     out the instant any block in the candidate body chain has its
+//     own conditional branch. Also unhandled: compound (&&/||)
+//     while-conditions, which compile to MULTIPLE chained
+//     conditional-branch blocks (each able to exit the loop) rather
+//     than a single one - and do/for-shaped back-edges where the
+//     condition check is the LAST block of the body rather than the
+//     first (this iteration only recognizes the condition-first
+//     "while" shape).
+//   - tbz/tbnz (test a single bit and branch) - structurally like
+//     cbz/cbnz (see isConditionalBranch) but not yet recognized.
+//   - ldr through a computed address (e.g. the adrp+ldr idiom for
+//     loading a GOT entry / global object pointer, as opposed to
+//     adrp+add for a string literal's own address - see addrRegs' doc
+//     comment) - would need a "read a pointer/value at this address"
+//     callback alongside StringResolver.
+//   - More ALU ops (sub/mul/and/orr/eor/...).
+//   - Non-parameter stack locals (regular local variables, not just
+//     spilled parameters), and loads/stores to non-stack memory (real
+//     pointer dereferences, not just the stack-slot bookkeeping this
+//     version does).
