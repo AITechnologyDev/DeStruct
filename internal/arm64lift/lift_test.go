@@ -296,3 +296,89 @@ func TestLiftFunction_TestBitBranch(t *testing.T) {
 	requireReturnedCall(t, ifStmt.Then, "step")
 	requireReturnedCall(t, ifStmt.Else, "other")
 }
+
+// TestLiftFunction_ALUOps lifts a hand-built instruction stream
+// equivalent to:
+//
+//	int f(int a, int b) {
+//	    return step((a - b) * b & 0xff);
+//	}
+//
+// exercising liftALU's sub (register-register), mul (register-
+// register, no immediate form), and and (register-immediate) cases.
+func TestLiftFunction_ALUOps(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// sub w2, w0, w1     (w2 = a - b)
+		{Address: 0x0, Size: 4, Mnemonic: "sub", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandReg, Reg: "w1"},
+		}},
+		// mul w2, w2, w1     (w2 = w2 * b)
+		{Address: 0x4, Size: 4, Mnemonic: "mul", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w1"},
+		}},
+		// and w0, w2, #0xff  (w0 = w2 & 0xff)
+		{Address: 0x8, Size: 4, Mnemonic: "and", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0xff},
+		}},
+		// bl step(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		{Address: 0x10, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"a", "b"}, resolver, nil)
+	if len(stmts) != 1 {
+		t.Fatalf("expected exactly 1 statement (the return), got %v", stmts)
+	}
+	ret, ok := stmts[0].(*ir.ReturnStmt)
+	if !ok {
+		t.Fatalf("expected a ReturnStmt, got %T: %v", stmts[0], stmts[0])
+	}
+	call, ok := ret.Value.(*ir.StaticMethodCall)
+	if !ok || call.Method != "step" || len(call.Args) == 0 {
+		// Args[1:] is just whatever's left over in w1 ("b", per
+		// aapcs64IntArgRegs' own arg-collection heuristic - see
+		// buildCall) since this test never overwrites it; only
+		// Args[0] (built from w0) is what this test actually cares
+		// about checking.
+		t.Fatalf("expected a call to \"step\" with at least 1 argument, got %#v", ret.Value)
+	}
+
+	and, ok := call.Args[0].(*ir.BinaryExpr)
+	if !ok || and.Op != "&" {
+		t.Fatalf("expected the argument to be a \"&\" expression, got %#v", call.Args[0])
+	}
+	if lit, ok := and.Right.(*ir.IntLit); !ok || lit.Value != 0xff {
+		t.Errorf("expected the \"&\" right side to be 0xff, got %#v", and.Right)
+	}
+	mul, ok := and.Left.(*ir.BinaryExpr)
+	if !ok || mul.Op != "*" {
+		t.Fatalf("expected the \"&\" left side to be a \"*\" expression, got %#v", and.Left)
+	}
+	sub, ok := mul.Left.(*ir.BinaryExpr)
+	if !ok || sub.Op != "-" {
+		t.Fatalf("expected the \"*\" left side to be a \"-\" expression, got %#v", mul.Left)
+	}
+	lhs, ok := sub.Left.(*ir.LocalVar)
+	if !ok || lhs.Name != "a" {
+		t.Errorf("expected the \"-\" left side to be param \"a\", got %#v", sub.Left)
+	}
+	rhs, ok := sub.Right.(*ir.LocalVar)
+	if !ok || rhs.Name != "b" {
+		t.Errorf("expected the \"-\" right side to be param \"b\", got %#v", sub.Right)
+	}
+}

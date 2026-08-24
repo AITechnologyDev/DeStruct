@@ -775,12 +775,11 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// logic (no C statement corresponds to it), so it's
 			// recognized and silently skipped rather than lifted into
 			// a meaningless "sp = sp - 16" statement. Any other "sub"
-			// (not targeting sp, or not matching this exact shape) is
-			// deliberately NOT specially handled yet and falls through
-			// unlifted - see the TODO at the bottom of this function.
+			// shape is ordinary arithmetic - see liftALU.
 			if isSpAdjust(inst) {
 				continue
 			}
+			stmts = append(stmts, l.liftALU(inst)...)
 		case "add":
 			if isSpAdjust(inst) {
 				// "add sp, sp, #N" is the matching -O0 epilogue - same
@@ -788,6 +787,8 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 				continue
 			}
 			stmts = append(stmts, l.liftAdd(inst)...)
+		case "and", "orr", "eor", "mul", "lsl", "lsr", "asr":
+			stmts = append(stmts, l.liftALU(inst)...)
 		case "adrp", "adr":
 			stmts = append(stmts, l.liftAddr(inst)...)
 		case "stp":
@@ -1048,6 +1049,68 @@ func (l *lifter) liftAdd(inst native.DetailedInstruction) []ir.Stmt {
 			l.addrRegs[dstOp.Reg] = base + uint64(rhsOp.Imm)
 		}
 		return stmts
+	default:
+		return nil
+	}
+}
+
+// aluOps maps an ALU/shift mnemonic (other than "add", which liftAdd
+// handles separately - see its own doc comment for why) to its IR
+// BinaryExpr operator and whether ARM64 actually encodes an
+// immediate-operand form for it at all - paired with liftALU below.
+var aluOps = map[string]struct {
+	irOp     string
+	allowImm bool
+}{
+	"sub": {"-", true},
+	"and": {"&", true},
+	"orr": {"|", true},
+	"eor": {"^", true},
+	"lsl": {"<<", true},
+	"lsr": {">>", true},
+	// asr (arithmetic shift right): ">>" is used as-is, correct for an
+	// already non-negative operand - this project's IR has no
+	// separate unsigned/signed-arithmetic shift operator, the same
+	// accepted approximation as the b.hs/b.lo/b.hi/b.ls unsigned
+	// condition codes already documented in condOpFromMnemonic.
+	"asr": {">>", true},
+	// mul has no immediate-operand encoding at all in AArch64 (always
+	// register*register) - allowImm=false rejects an immediate rhs as
+	// an ISA-level fact, not an arbitrary lifter restriction.
+	"mul": {"*", false},
+}
+
+// liftALU lifts the common "Rd, Rn, Rm" (register-register) or
+// "Rd, Rn, #imm" (register-immediate) ALU/shift instruction shape -
+// every mnemonic in aluOps - into an ir.BinaryExpr, recorded as Rd's
+// new value in the register file. Not emitted as a statement of its
+// own: same reasoning as liftAdd (its closest sibling, kept separate
+// since it also propagates addrRegs for the adrp+add idiom, which
+// none of these other ops ever participate in) - a bare arithmetic
+// result only becomes source-level meaningful once something (a
+// return, a call argument, ...) actually consumes it.
+func (l *lifter) liftALU(inst native.DetailedInstruction) []ir.Stmt {
+	op, ok := aluOps[inst.Mnemonic]
+	if !ok || len(inst.Operands) != 3 {
+		return nil
+	}
+	dstOp, lhsOp, rhsOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+	if dstOp.Type != native.OperandReg || lhsOp.Type != native.OperandReg {
+		return nil
+	}
+	lhs := l.regValue(lhsOp.Reg)
+	l.consume(lhs)
+
+	switch rhsOp.Type {
+	case native.OperandReg:
+		rhs := l.regValue(rhsOp.Reg)
+		l.consume(rhs)
+		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
+	case native.OperandImm:
+		if !op.allowImm {
+			return nil
+		}
+		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: &ir.IntLit{Value: rhsOp.Imm}})
 	default:
 		return nil
 	}
@@ -1383,6 +1446,31 @@ func (l *lifter) isOrphanCandidate(e ir.Expr, exceptReg string) bool {
 // return value, ...) supersedes it before anything reads it. The other
 // half, flushRemaining, covers a call that survives all the way to the
 // end of this lifter's path without ever being overwritten OR read.
+// wRegToX returns the 64-bit register name aliasing the SAME physical
+// register as reg, and true - or ("", false) if reg isn't a plain
+// "w<N>" name. Writing a W register always zero-extends into the full
+// X register on real AArch64 hardware, so clobberReg/setReg mirror
+// every W-register write (or clobber) into its X alias too - the
+// direction that matters for THIS lifter, since buildCall's
+// arg-collection and liftRet both read the X-named register (per
+// aapcs64IntArgRegs), even for a value that only ever makes sense as
+// the 32-bit "int" a W-only write actually computed. The reverse (an
+// X-register write propagating down into its W alias) is deliberately
+// NOT done: a 64-bit value's low 32 bits aren't obviously "the same
+// value" the way zero-extension makes the W->X direction exact, and
+// nothing in this lifter currently needs it.
+func wRegToX(reg string) (string, bool) {
+	if len(reg) < 2 || reg[0] != 'w' {
+		return "", false
+	}
+	for _, c := range reg[1:] {
+		if c < '0' || c > '9' {
+			return "", false
+		}
+	}
+	return "x" + reg[1:], true
+}
+
 func (l *lifter) clobberReg(reg string) []ir.Stmt {
 	var stmts []ir.Stmt
 	if old, ok := l.regs[reg]; ok && l.isOrphanCandidate(old, reg) {
@@ -1396,6 +1484,18 @@ func (l *lifter) clobberReg(reg string) []ir.Stmt {
 	// immediate case propagating through "add Rd, Rn, #imm", re-adds
 	// its own entry immediately after calling setReg/clobberReg.
 	delete(l.addrRegs, reg)
+	// See wRegToX's own doc comment: clobbering "w0" must also
+	// invalidate "x0" (recursing exactly once, since wRegToX("x0")
+	// itself returns ok=false) - done AFTER reg's own entry above is
+	// already gone, so isOrphanCandidate's reachable-elsewhere check
+	// for xReg's old value (if it happens to be the very same
+	// still-aliased expression reg just held) correctly sees it as no
+	// longer reachable under reg and flushes it here, exactly once,
+	// rather than never (each alias's own isOrphanCandidate check
+	// would otherwise always find the OTHER alias still holding it).
+	if xReg, ok := wRegToX(reg); ok {
+		stmts = append(stmts, l.clobberReg(xReg)...)
+	}
 	return stmts
 }
 
@@ -1403,10 +1503,16 @@ func (l *lifter) clobberReg(reg string) []ir.Stmt {
 // the single entry point every instruction that writes a register
 // should use (instead of assigning l.regs[reg] directly) so an
 // orphaned call sitting there never gets silently overwritten without
-// being flushed first.
+// being flushed first. A W-register write also installs val under its
+// X alias (see wRegToX/clobberReg), so a value computed via a 32-bit
+// "int"-width instruction is still visible to anything (buildCall,
+// liftRet) that reads the 64-bit name instead.
 func (l *lifter) setReg(reg string, val ir.Expr) []ir.Stmt {
 	stmts := l.clobberReg(reg)
 	l.regs[reg] = val
+	if xReg, ok := wRegToX(reg); ok {
+		l.regs[xReg] = val
+	}
 	return stmts
 }
 
@@ -1491,11 +1597,12 @@ func (l *lifter) liftRet() ir.Stmt {
 
 // TODO(next iterations): calls, comparisons/if-else, generic mov,
 // void-call statement emission, adrp/adr string-literal resolution,
-// ldr-through-GOT global-object resolution, and plain single-condition
+// ldr-through-GOT global-object resolution, plain single-condition
 // "while (cond) { straight-line body }" loops (cmp+b.cond, cbz/cbnz,
-// or tbz/tbnz) are now handled (see liftCall/liftMov/flushRemaining,
-// liftAddr/buildCall's StringResolver use, liftLdr's addrRegs+resolver
-// use with ELFParser.ResolveGOT, and tryLiftWhileLoop/findLoopBody).
+// or tbz/tbnz), and more ALU/shift ops (sub/and/orr/eor/mul/lsl/lsr/
+// asr) are now handled (see liftCall/liftMov/flushRemaining, liftAddr/
+// buildCall's StringResolver use, liftLdr's addrRegs+resolver use with
+// ELFParser.ResolveGOT, tryLiftWhileLoop/findLoopBody, and liftALU).
 // Remaining growth areas, roughly in order of how often real-world -O0
 // code needs them:
 //   - Loop bodies containing their own nested control flow (an if, a
@@ -1508,7 +1615,6 @@ func (l *lifter) liftRet() ir.Stmt {
 //     condition check is the LAST block of the body rather than the
 //     first (this iteration only recognizes the condition-first
 //     "while" shape).
-//   - More ALU ops (sub/mul/and/orr/eor/...).
 //   - Non-parameter stack locals (regular local variables, not just
 //     spilled parameters), and loads/stores to non-stack memory (real
 //     pointer dereferences, not just the stack-slot bookkeeping this
