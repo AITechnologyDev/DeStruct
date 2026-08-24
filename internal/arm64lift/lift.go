@@ -800,7 +800,7 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 		case "str":
 			l.liftStr(inst)
 		case "ldr":
-			l.liftLdr(inst)
+			stmts = append(stmts, l.liftLdr(inst)...)
 		case "cmp":
 			l.liftCmp(inst)
 		case "bl":
@@ -931,30 +931,70 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) {
 // same parameter (not a "load" statement - there's nothing to say at
 // the source level; the parameter's value simply flows into the
 // register that will use it next).
-func (l *lifter) liftLdr(inst native.DetailedInstruction) {
+// liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. Two shapes
+// are recognized:
+//
+//   - A stack slot previously spilled by liftStr: if this displacement
+//     was recorded as holding a named parameter, the destination
+//     register now holds an IR reference to that same parameter (not
+//     a "load" statement - there's nothing to say at the source
+//     level; the parameter's value simply flows into the register
+//     that will use it next).
+//   - A GOT/data slot at a known computed address: Rn is a register
+//     addrRegs recorded an address for (see its own doc comment,
+//     populated by adrp/adr(+add)) - if the resolver knows a name for
+//     whatever's stored at that exact address (built from the
+//     binary's .rela.dyn relocations - see
+//     ELFParser.ResolveGOT's own doc comment for how, e.g., a
+//     dynamically-linked std::cout resolves this way), the destination
+//     register holds a reference to that name instead of an anonymous
+//     loaded value - the common case being a GOT-loaded pointer to a
+//     global object that the very next instruction typically uses as
+//     an implicit `this`/first argument to some call (an operator<<
+//     onto std::cout, say).
+//
+// Anything else (a load from a register that's neither a stack slot
+// nor a known address, or one that IS a known address but doesn't
+// resolve to any name) isn't lifted yet, but the destination register
+// is still clobbered (see clobberReg): the real CPU DID overwrite it
+// with whatever the load actually produced, so leaving its old IR
+// value in place would misrepresent it as still holding that stale
+// value rather than an unknown freshly-loaded one.
+func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 2 {
-		return
+		return nil
 	}
 	dstOp, srcOp := inst.Operands[0], inst.Operands[1]
 	if dstOp.Type != native.OperandReg || srcOp.Type != native.OperandMem {
-		return
+		return nil
 	}
-	if srcOp.Mem.Base != "sp" || srcOp.Mem.Index != "" {
-		return
+	if srcOp.Mem.Index != "" {
+		return nil
 	}
 
-	if name, ok := l.stack[srcOp.Mem.Disp]; ok {
-		l.regs[dstOp.Reg] = &ir.LocalVar{Name: name}
+	if srcOp.Mem.Base == "sp" {
+		if name, ok := l.stack[srcOp.Mem.Disp]; ok {
+			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: name})
+		}
+		return l.clobberReg(dstOp.Reg)
 	}
+
+	if base, ok := l.addrRegs[srcOp.Mem.Base]; ok && l.resolver != nil {
+		addr := base + uint64(srcOp.Mem.Disp)
+		if name, ok := l.resolver(addr); ok {
+			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: demangle(name)})
+		}
+	}
+
+	return l.clobberReg(dstOp.Reg)
 }
 
-// liftAdd lifts "add Rd, Rn, Rm" (register-register add; the immediate
-// form "add Rd, Rn, #imm" isn't handled yet - see the TODO at the
-// bottom of this file) into an IR BinaryExpr, recorded as Rd's new
-// value in the register file - not emitted as a statement yet, since a
-// bare arithmetic result with nothing done with it isn't source-level
-// meaningful on its own; it becomes a statement once something (a
-// return, a store, ...) actually consumes it.
+// liftAdd lifts "add Rd, Rn, Rm" (register-register add) and
+// "add Rd, Rn, #imm" (register-immediate) into an IR BinaryExpr,
+// recorded as Rd's new value in the register file - not emitted as a
+// statement yet, since a bare arithmetic result with nothing done with
+// it isn't source-level meaningful on its own; it becomes a statement
+// once something (a return, a store, ...) actually consumes it.
 func (l *lifter) liftAdd(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 3 {
 		return nil
@@ -1430,11 +1470,13 @@ func (l *lifter) liftRet() ir.Stmt {
 
 // TODO(next iterations): calls, comparisons/if-else, generic mov,
 // void-call statement emission, adrp/adr string-literal resolution,
-// and plain single-condition "while (cond) { straight-line body }"
-// loops (cmp+b.cond or cbz/cbnz) are now handled (see liftCall/
-// liftMov/flushRemaining, liftAddr/buildCall's StringResolver use, and
-// tryLiftWhileLoop/findLoopBody). Remaining growth areas, roughly in
-// order of how often real-world -O0 code needs them:
+// ldr-through-GOT global-object resolution, and plain single-condition
+// "while (cond) { straight-line body }" loops (cmp+b.cond or cbz/cbnz)
+// are now handled (see liftCall/liftMov/flushRemaining, liftAddr/
+// buildCall's StringResolver use, liftLdr's addrRegs+resolver use with
+// ELFParser.ResolveGOT, and tryLiftWhileLoop/findLoopBody). Remaining
+// growth areas, roughly in order of how often real-world -O0 code
+// needs them:
 //   - Loop bodies containing their own nested control flow (an if, a
 //     break/continue, a nested loop) - findLoopBody currently bails
 //     out the instant any block in the candidate body chain has its
@@ -1447,11 +1489,6 @@ func (l *lifter) liftRet() ir.Stmt {
 //     "while" shape).
 //   - tbz/tbnz (test a single bit and branch) - structurally like
 //     cbz/cbnz (see isConditionalBranch) but not yet recognized.
-//   - ldr through a computed address (e.g. the adrp+ldr idiom for
-//     loading a GOT entry / global object pointer, as opposed to
-//     adrp+add for a string literal's own address - see addrRegs' doc
-//     comment) - would need a "read a pointer/value at this address"
-//     callback alongside StringResolver.
 //   - More ALU ops (sub/mul/and/orr/eor/...).
 //   - Non-parameter stack locals (regular local variables, not just
 //     spilled parameters), and loads/stores to non-stack memory (real

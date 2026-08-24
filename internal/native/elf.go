@@ -10,22 +10,22 @@ import (
 
 // ELF constants
 const (
-	ELF_MAGIC = "\x7fELF"
-	ELFCLASS32 = 1
-	ELFCLASS64 = 2
-	ELFDATA2LSB = 1
-	ELFDATA2MSB = 2
-	ET_EXEC = 2
-	ET_DYN = 3
-	EM_ARM = 40
-	EM_AARCH64 = 183
-	EM_386 = 3
-	EM_X86_64 = 62
+	ELF_MAGIC    = "\x7fELF"
+	ELFCLASS32   = 1
+	ELFCLASS64   = 2
+	ELFDATA2LSB  = 1
+	ELFDATA2MSB  = 2
+	ET_EXEC      = 2
+	ET_DYN       = 3
+	EM_ARM       = 40
+	EM_AARCH64   = 183
+	EM_386       = 3
+	EM_X86_64    = 62
 	SHT_PROGBITS = 1
-	SHT_SYMTAB = 2
-	SHT_DYNSYM = 11
-	SHT_RELA = 4
-	STT_FUNC = 2
+	SHT_SYMTAB   = 2
+	SHT_DYNSYM   = 11
+	SHT_RELA     = 4
+	STT_FUNC     = 2
 )
 
 // ELF file structures
@@ -757,6 +757,116 @@ func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
 		gotAddr := page + uint64(int64(ldr.Operands[1].Mem.Disp))
 		if name, ok := gotToName[gotAddr]; ok {
 			result[adrp.Address] = name
+		}
+	}
+
+	return result, nil
+}
+
+// ARM64 relocation types this project's GOT/data-slot resolution
+// cares about (from the AArch64 ELF ABI - ordinary Elf64_Rela type
+// codes, not Capstone or anything ARM64-lifter-specific).
+const (
+	rAARCH64_ABS64    = 257
+	rAARCH64_GLOB_DAT = 1025
+	rAARCH64_RELATIVE = 1027
+)
+
+// ResolveGOT builds a map from a data/GOT slot's absolute address
+// (the same address a "adrp Xd, #page" + "ldr Xt, [Xd, #off]" pair
+// computes and then dereferences - see arm64lift's addrRegs/liftLdr
+// for the lifter side of this) to a human-readable name for whatever
+// pointer is actually stored there, by reading .rela.dyn (the dynamic
+// linker's relocations for ordinary data, as opposed to .rela.plt's
+// function-only JUMP_SLOT entries that ResolvePLT already handles):
+//
+//   - R_AARCH64_RELATIVE: the slot's link-time-resolved value is
+//     r_addend itself (a plain module-relative address, consistent
+//     with how every other address in this package is already
+//     treated as load-bias-0) - resolved to whatever named symbol (in
+//     either .symtab or .dynsym) starts at exactly that address, if
+//     any. This is the common case for a GOT slot holding the address
+//     of some object DEFINED in this same module (e.g. a vtable, a
+//     typeinfo, or - the case that matters most for readability - a
+//     global object like an iostream instance that a compiler-emitted
+//     alias/reference for the "same" extern symbol resolves to
+//     locally).
+//   - R_AARCH64_GLOB_DAT / R_AARCH64_ABS64: the slot instead refers to
+//     a symbol resolved by NAME through .dynsym - typically an extern
+//     global truly defined in another shared object (e.g. a
+//     dynamically-linked libc++'s std::cout/std::cerr) that this
+//     module only imports, so there's no local address to resolve at
+//     all - only the imported symbol's own (mangled) name.
+//
+// Slots whose relocation type isn't one of these, or whose target
+// address/symbol index doesn't resolve to any name, are simply absent
+// from the result - callers should treat that the same as any other
+// unresolved address (fall back to a raw numeric value).
+func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
+	dynsyms, dynstrNdx, err := p.parseDynsym()
+	if err != nil {
+		return nil, err
+	}
+	if int(dynstrNdx) >= len(p.Sections) {
+		return nil, fmt.Errorf("invalid .dynsym string table index")
+	}
+	dynstrSec := p.Sections[dynstrNdx]
+
+	dynsymName := func(sym SymbolEntry) string {
+		start := dynstrSec.Offset + uint64(sym.Name)
+		if start >= uint64(len(p.Data)) {
+			return ""
+		}
+		end := bytes.IndexByte(p.Data[start:], 0)
+		if end < 0 {
+			return ""
+		}
+		return string(p.Data[start : start+uint64(end)])
+	}
+
+	// Index every named symbol (both .symtab and .dynsym - a locally
+	// DEFINED object a RELATIVE relocation points at could show up in
+	// either table depending on whether it's also exported) by its
+	// exact address, for RELATIVE relocations to look up by target.
+	byAddr := make(map[uint64]string)
+	for _, sym := range p.Symbols {
+		if sym.Value == 0 {
+			continue
+		}
+		if name := p.GetSymbolName(sym); name != "" {
+			byAddr[sym.Value] = name
+		}
+	}
+	for _, sym := range dynsyms {
+		if sym.Value == 0 {
+			continue
+		}
+		if name := dynsymName(sym); name != "" {
+			byAddr[sym.Value] = name
+		}
+	}
+
+	result := make(map[uint64]string)
+	for _, sec := range p.Sections {
+		if sec.Type != SHT_RELA || p.getSectionName(sec) != ".rela.dyn" {
+			continue
+		}
+		for _, rel := range p.parseRelaSection(sec) {
+			relType := rel.Info & 0xffffffff
+			switch relType {
+			case rAARCH64_RELATIVE:
+				if name, ok := byAddr[uint64(rel.Addend)]; ok {
+					result[rel.Offset] = name
+				}
+			case rAARCH64_GLOB_DAT, rAARCH64_ABS64:
+				idx := rel.SymbolIndex()
+				if int(idx) >= len(dynsyms) {
+					continue
+				}
+				if name := dynsymName(dynsyms[idx]); name != "" {
+					result[rel.Offset] = name
+				}
+			}
 		}
 	}
 

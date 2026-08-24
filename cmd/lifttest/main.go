@@ -63,6 +63,12 @@ func main() {
 		plt = nil
 	}
 
+	got, err := p.ResolveGOT()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: GOT resolution failed: %v\n", err)
+		got = nil
+	}
+
 	symByAddr := make(map[uint64]string)
 	for _, sym := range p.Symbols {
 		if name := p.GetSymbolName(sym); name != "" {
@@ -70,11 +76,18 @@ func main() {
 		}
 	}
 
+	// One shared address->name oracle for both call targets (bl/tail
+	// call "b") and GOT/data-slot addresses an "ldr" dereferences (see
+	// liftLdr's own doc comment) - the same lookup, just fed a
+	// different kind of address depending on the caller.
 	resolver := func(addr uint64) (string, bool) {
 		if name, ok := symByAddr[addr]; ok {
 			return name, true
 		}
 		if name, ok := plt[addr]; ok {
+			return name, true
+		}
+		if name, ok := got[addr]; ok {
 			return name, true
 		}
 		return "", false

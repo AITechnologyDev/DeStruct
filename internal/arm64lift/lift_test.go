@@ -152,3 +152,65 @@ func TestLiftFunction_BudgetCapsExponentialBlowup(t *testing.T) {
 		t.Fatal("LiftFunction did not return within 5s - the block-visit budget cap appears not to be working")
 	}
 }
+
+// TestLiftFunction_LdrThroughGOT lifts a hand-built instruction stream
+// equivalent to the "adrp+ldr" idiom real -O0 code uses to load a
+// global object's address out of the GOT (as opposed to adrp+add,
+// which computes an address without dereferencing it - e.g. a string
+// literal's own address - see liftAddr's doc comment), then calls a
+// resolved function with that loaded value as its argument:
+//
+//	std::cerr << ...   // conceptually: some_func(cerr)
+//
+// mirroring exactly what print_usage's real disassembly does to reach
+// std::cerr (see ELFParser.ResolveGOT's own TestResolveGOT, which
+// confirms the real GOT slot address this test's resolver mimics).
+func TestLiftFunction_LdrThroughGOT(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// adrp x0, #0x1000
+		{Address: 0x0, Size: 4, Mnemonic: "adrp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandImm, Imm: 0x1000},
+		}},
+		// ldr x0, [x0, #0x168]   (loads the GOT slot at 0x1168)
+		{Address: 0x4, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0", Disp: 0x168}},
+		}},
+		// bl some_func(0x500)
+		{Address: 0x8, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x500},
+		}},
+		{Address: 0xc, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x1168:
+			return "_ZNSt6__ndk14cerrE", true
+		case 0x500:
+			return "some_func", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+	if len(stmts) != 1 {
+		t.Fatalf("expected exactly 1 statement (the return), got %v", stmts)
+	}
+	ret, ok := stmts[0].(*ir.ReturnStmt)
+	if !ok {
+		t.Fatalf("expected a ReturnStmt, got %T: %v", stmts[0], stmts[0])
+	}
+	call, ok := ret.Value.(*ir.StaticMethodCall)
+	if !ok || call.Method != "some_func" {
+		t.Fatalf("expected a call to \"some_func\", got %#v", ret.Value)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected exactly 1 argument, got %v", call.Args)
+	}
+	arg, ok := call.Args[0].(*ir.LocalVar)
+	if !ok || arg.Name != "_ZNSt6__ndk14cerrE" {
+		t.Errorf("expected the argument to be a reference to the resolved GOT name, got %#v", call.Args[0])
+	}
+}
