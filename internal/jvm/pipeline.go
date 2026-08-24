@@ -10,29 +10,43 @@ import (
 	"github.com/destruct/destruct/internal/ir"
 )
 
+// typeParamNames is keyed by ParsedType.Base's OWN spelling for each
+// primitive (see parseTypeAtIndex in descriptors.go) - NOT Java's own
+// primitive keywords, which don't all match: 'Z' (boolean) parses to
+// Base "bool", and 'B' (byte) parses to Base "sbyte", so a "boolean"/
+// "byte" key here would silently never match and fall through to the
+// generic derivation below instead.
 var typeParamNames = map[string]string{
-	"boolean": "flag",
-	"byte":    "b",
-	"char":    "c",
-	"short":   "s",
-	"int":     "i",
-	"long":    "l",
-	"float":   "f",
-	"double":  "d",
-	"String":  "str",
+	"bool":   "flag",
+	"sbyte":  "b",
+	"char":   "c",
+	"short":  "s",
+	"int":    "i",
+	"long":   "l",
+	"float":  "f",
+	"double": "d",
 }
 
+// classParamNames is keyed by a reference type's full internal (slash-
+// separated) class name, matching ParsedType.Base's own format for a
+// non-primitive parameter - e.g. "java/lang/Thread", never the bare
+// "Thread" or the dotted "java.lang.Thread". "java/lang/Class" maps to
+// "clazz" specifically to avoid colliding with the reserved word
+// "class" that inferParamName's own generic derivation would otherwise
+// produce (lowercasing "Class" - see below); every other name here is
+// just a nicer synthesized name than the generic fallback would give.
 var classParamNames = map[string]string{
-	"java/lang/Thread":    "thread",
-	"java/lang/String":    "str",
-	"java/lang/Object":    "obj",
-	"java/lang/Integer":   "value",
-	"java/lang/Boolean":   "value",
-	"java/util/List":      "list",
-	"java/util/Map":       "map",
-	"java/util/Set":       "set",
-	"java/util/Collection":"coll",
-	"java/util/Iterator":  "iter",
+	"java/lang/Thread":     "thread",
+	"java/lang/String":     "str",
+	"java/lang/Object":     "obj",
+	"java/lang/Class":      "clazz",
+	"java/lang/Integer":    "value",
+	"java/lang/Boolean":    "value",
+	"java/util/List":       "list",
+	"java/util/Map":        "map",
+	"java/util/Set":        "set",
+	"java/util/Collection": "coll",
+	"java/util/Iterator":   "iter",
 }
 
 func inferParamName(p ParsedType, idx int) string {
@@ -40,6 +54,9 @@ func inferParamName(p ParsedType, idx int) string {
 		return fmt.Sprintf("arr%d", idx)
 	}
 	if name, ok := typeParamNames[p.Base]; ok {
+		return name
+	}
+	if name, ok := classParamNames[p.Base]; ok {
 		return name
 	}
 	simpleName := p.Base
@@ -320,7 +337,7 @@ func decompileClassFile(cf *ClassFile) (*ir.Program, error) {
 
 	for i, method := range cf.Methods {
 		methodDecl := ir.Method{
-			Name:   cf.GetUTF8(method.NameIndex),
+			Name:   sanitizeMethodName(cf.GetUTF8(method.NameIndex)),
 			Access: ir.AccessFlags(method.AccessFlags),
 		}
 		params, ret := ParseDescriptor(cf.GetUTF8(method.DescriptorIndex))

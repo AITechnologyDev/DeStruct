@@ -3,6 +3,7 @@ package jvm
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/destruct/destruct/internal/ir"
 )
@@ -49,6 +50,101 @@ func (s *exprStack) len() int {
 // intent)` in the signature, but `arg0`/`arg1` used throughout the body,
 // whenever the class had been stripped of debug info by a tool like
 // ProGuard/R8 - common for real-world Android apps).
+// javaKeywords is the full set of Java reserved words and literals -
+// never valid as an identifier, regardless of whether the name came
+// from real LocalVariableTable debug info or was synthesized by
+// inferParamName (a reference parameter of type java.lang.Class, say,
+// naturally lowercases to "class" - see classParamNames' own doc
+// comment for how that specific case is avoided, but escapeIdent below
+// is the general safety net for every other case, known or not).
+var javaKeywords = map[string]bool{
+	"abstract": true, "assert": true, "boolean": true, "break": true,
+	"byte": true, "case": true, "catch": true, "char": true, "class": true,
+	"const": true, "continue": true, "default": true, "do": true,
+	"double": true, "else": true, "enum": true, "extends": true,
+	"final": true, "finally": true, "float": true, "for": true,
+	"goto": true, "if": true, "implements": true, "import": true,
+	"instanceof": true, "int": true, "interface": true, "long": true,
+	"native": true, "new": true, "package": true, "private": true,
+	"protected": true, "public": true, "return": true, "short": true,
+	"static": true, "strictfp": true, "super": true, "switch": true,
+	"synchronized": true, "this": true, "throw": true, "throws": true,
+	"transient": true, "try": true, "void": true, "volatile": true,
+	"while": true, "true": true, "false": true, "null": true,
+	// Contextual keywords/reserved type names (not full keywords in
+	// every position, but never worth risking as a plain identifier).
+	"var": true, "yield": true, "record": true, "sealed": true,
+	"permits": true,
+}
+
+// escapeIdent appends a trailing underscore if name is a Java reserved
+// word/literal - the minimal change that keeps it recognizably the
+// same name while making it legal again (e.g. "class" -> "class_").
+func escapeIdent(name string) string {
+	if javaKeywords[name] {
+		return name + "_"
+	}
+	return name
+}
+
+// disambiguate returns name unchanged if it isn't already in used,
+// otherwise a numbered variant (name2, name3, ...) that isn't - dedup
+// for the common case where two different parameters/locals in the
+// SAME method independently end up wanting the same name (most often
+// inferParamName's type-based fallback: two "int" parameters both
+// naturally called "i" when the class file's own debug info is gone,
+// but real LocalVariableTable names can collide too, e.g. against an
+// already-assigned parameter name). Always marks the name it returns
+// as used, so a later call against the same set never repeats it.
+func disambiguate(name string, used map[string]bool) string {
+	candidate := name
+	for n := 2; used[candidate]; n++ {
+		candidate = fmt.Sprintf("%s%d", name, n)
+	}
+	used[candidate] = true
+	return candidate
+}
+
+// sanitizeMethodName makes name safe to emit as a Java method
+// identifier. Bytecode method names aren't restricted to valid Java
+// identifier syntax the way source-level names are - real -O0-style
+// javac/R8 output includes names like "-$$Nest$fgetsomeField" (a
+// nestmate private-field accessor, note the LEADING hyphen) and
+// "lambda$onCreate$0$some-package-Name" (a synthetic lambda body,
+// hyphens from a dotted-to-hyphenated enclosing class name) - both
+// perfectly legal in the constant pool, neither valid as literal
+// source text. Every character that isn't a valid Java identifier
+// character (a letter, '_', '$', or a digit NOT in first position) is
+// replaced with '_'; "<init>"/"<clinit>" pass through unchanged, since
+// those are sentinel values the java package's own template matches
+// on exactly (see the constructor/static-initializer branches in
+// generator.go's javaTemplate) rather than ever rendering as literal
+// identifier text - sanitizing them here would break that match.
+//
+// Applied everywhere a method name flows into rendered Java source: at
+// its own declaration (pipeline.go) and at every call site
+// (decompileInvoke/decompileInvokeDynamic below) - NOT at points that
+// only use the raw bytecode name for internal bookkeeping, like
+// inlineLambdaBody's own by-name method lookup, which must keep
+// matching the class file's real, unsanitized names.
+func sanitizeMethodName(name string) string {
+	if name == "<init>" || name == "<clinit>" {
+		return name
+	}
+	var b strings.Builder
+	for i, r := range name {
+		switch {
+		case r == '_' || r == '$' || unicode.IsLetter(r):
+			b.WriteRune(r)
+		case i > 0 && unicode.IsDigit(r):
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
 func buildParamNames(cf *ClassFile, methodIdx int) map[uint16]string {
 	method := cf.Methods[methodIdx]
 	isStatic := method.AccessFlags&0x0008 != 0
@@ -61,9 +157,11 @@ func buildParamNames(cf *ClassFile, methodIdx int) map[uint16]string {
 	}
 
 	names := make(map[uint16]string, len(params))
+	used := make(map[string]bool, len(params)+1)
 	slot := uint16(0)
 	if !isStatic {
 		slot = 1
+		used["this"] = true
 	}
 	for argIdx, p := range params {
 		name := ""
@@ -72,7 +170,7 @@ func buildParamNames(cf *ClassFile, methodIdx int) map[uint16]string {
 		} else {
 			name = inferParamName(p, argIdx)
 		}
-		names[slot] = name
+		names[slot] = disambiguate(escapeIdent(name), used)
 		slot++
 		if p.Base == "long" || p.Base == "double" {
 			slot++
@@ -87,13 +185,16 @@ func resolveLocalVars(cf *ClassFile, methodIdx int, code *CodeAttribute) map[uin
 	isStatic := method.AccessFlags&0x0008 != 0
 	params, _ := ParseDescriptor(cf.GetUTF8(method.DescriptorIndex))
 
+	used := make(map[string]bool)
 	if !isStatic {
 		vars[0] = "this"
+		used["this"] = true
 	}
 
 	paramNames := buildParamNames(cf, methodIdx)
 	for slot, name := range paramNames {
 		vars[slot] = name
+		used[name] = true
 	}
 
 	paramEnd := uint16(0)
@@ -112,7 +213,7 @@ func resolveLocalVars(cf *ClassFile, methodIdx int, code *CodeAttribute) map[uin
 		if entry.Index < paramEnd {
 			continue // already named via buildParamNames above
 		}
-		vars[entry.Index] = cf.GetUTF8(entry.NameIndex)
+		vars[entry.Index] = disambiguate(escapeIdent(cf.GetUTF8(entry.NameIndex)), used)
 	}
 
 	return vars
@@ -261,9 +362,32 @@ func classNameToJavaName(name string) string {
 		return "Character"
 	default:
 		name = strings.ReplaceAll(name, "/", ".")
-		name = strings.ReplaceAll(name, "$", ".")
+		name = dollarToDot(name)
 		return name
 	}
+}
+
+// dollarToDot converts internal-name '$' nested-class separators to
+// '.', matching ordinary Java member-access notation ("Outer$Inner" ->
+// "Outer.Inner") - EXCEPT when the segment right after a '$' starts
+// with a digit, which is how javac names an anonymous class
+// ("Outer$3") or a local class ("Outer$1LocalName"): neither is valid
+// after a literal '.' in real Java source (a digit there lexes as the
+// start of a number, not an identifier), so that specific '$' is left
+// as-is - "$" is itself a legal Java identifier character, so
+// "Outer$3" stays exactly that rather than becoming the unparseable
+// "Outer.3".
+func dollarToDot(name string) string {
+	var b strings.Builder
+	runes := []rune(name)
+	for i, r := range runes {
+		if r == '$' && i+1 < len(runes) && !unicode.IsDigit(runes[i+1]) {
+			b.WriteRune('.')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func decompileInstruction(cf *ClassFile, code *CodeAttribute, instructions []Instruction, inst Instruction, localVars map[uint16]string, stack *exprStack, className string) []ir.Stmt {
@@ -871,7 +995,7 @@ func decompileInvoke(cf *ClassFile, idx uint16, kind string, stack *exprStack) [
 		return nil
 	}
 
-	methodName := cf.GetUTF8(cf.ConstantPool[natIdx].NameAndType.NameIndex)
+	methodName := sanitizeMethodName(cf.GetUTF8(cf.ConstantPool[natIdx].NameAndType.NameIndex))
 	methodDesc := cf.GetUTF8(cf.ConstantPool[natIdx].NameAndType.DescriptorIndex)
 	javaClass := classNameToJavaName(className)
 	params, _ := ParseDescriptor(methodDesc)
@@ -942,7 +1066,7 @@ func decompileInvokedynamic(cf *ClassFile, idx uint16, stack *exprStack) []ir.St
 		return nil
 	}
 
-	methodName := cf.GetUTF8(cf.ConstantPool[natIdx].NameAndType.NameIndex)
+	methodName := sanitizeMethodName(cf.GetUTF8(cf.ConstantPool[natIdx].NameAndType.NameIndex))
 	methodDesc := cf.GetUTF8(cf.ConstantPool[natIdx].NameAndType.DescriptorIndex)
 
 	if className, targetMethod, ok := cf.ResolveLambdaTarget(idx); ok {
@@ -979,7 +1103,13 @@ func decompileInvokedynamic(cf *ClassFile, idx uint16, stack *exprStack) []ir.St
 			}
 		}
 
-		stack.push(&ir.MethodRefExpr{ClassName: classNameToJavaName(className), MethodName: targetMethod})
+		// Sanitized only here, at the point this name is actually
+		// embedded into rendered Java source - targetMethod itself must
+		// stay the class file's raw, unsanitized name up to this point
+		// (the "lambda$" prefix check and inlineLambdaBody's own by-name
+		// method lookup above both match against the real bytecode
+		// name).
+		stack.push(&ir.MethodRefExpr{ClassName: classNameToJavaName(className), MethodName: sanitizeMethodName(targetMethod)})
 		return nil
 	}
 

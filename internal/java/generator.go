@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+	"unicode"
 
 	"github.com/destruct/destruct/internal/ir"
 )
@@ -433,9 +434,34 @@ func classNameToJava(name string) string {
 		return "void"
 	default:
 		name = strings.ReplaceAll(name, "/", ".")
-		name = strings.ReplaceAll(name, "$", ".")
+		name = dollarToDot(name)
 		return name
 	}
+}
+
+// dollarToDot converts internal-name '$' nested-class separators to
+// '.', matching ordinary Java member-access notation ("Outer$Inner" ->
+// "Outer.Inner") - EXCEPT when the segment right after a '$' starts
+// with a digit, which is how javac names an anonymous class
+// ("Outer$3") or a local class ("Outer$1LocalName"): neither is valid
+// after a literal '.' in real Java source (a digit there lexes as the
+// start of a number, not an identifier), so that specific '$' is left
+// as-is - "$" is itself a legal Java identifier character, so
+// "Outer$3" stays exactly that rather than becoming the unparseable
+// "Outer.3". Mirrored in internal/jvm/decoder.go's own dollarToDot
+// (the two packages don't share a dependency this small utility is
+// otherwise worth introducing one for).
+func dollarToDot(name string) string {
+	var b strings.Builder
+	runes := []rune(name)
+	for i, r := range runes {
+		if r == '$' && i+1 < len(runes) && !unicode.IsDigit(runes[i+1]) {
+			b.WriteRune('.')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 var primitiveTypes = map[string]bool{
@@ -452,7 +478,7 @@ func collectImports(class *ir.Class) []string {
 
 	addImport := func(typeName string) {
 		name := strings.ReplaceAll(typeName, "/", ".")
-		name = strings.ReplaceAll(name, "$", ".")
+		name = dollarToDot(name)
 		if primitiveTypes[name] {
 			return
 		}
@@ -673,6 +699,8 @@ const javaTemplate = `{{- if .Package}}package {{.Package}};
 {{- if .Body}}{{range .Body.Statements}}{{- if not (isReturnVoid .)}}
 		{{.}}{{- end}}{{- end}}{{- end}}
 	}
+{{- else if or .Access.IsNative .Access.IsAbstract}}
+	{{acc .Access}}{{mmod .Access}}{{typeName .ReturnType}} {{.Name}}({{params .Params}});
 {{- else}}
 	{{acc .Access}}{{mmod .Access}}{{typeName .ReturnType}} {{.Name}}({{params .Params}}) {
 {{- if .Body}}{{range .Body.Statements}}
