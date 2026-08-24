@@ -214,3 +214,85 @@ func TestLiftFunction_LdrThroughGOT(t *testing.T) {
 		t.Errorf("expected the argument to be a reference to the resolved GOT name, got %#v", call.Args[0])
 	}
 }
+
+// TestLiftFunction_TestBitBranch lifts a hand-built instruction stream
+// equivalent to:
+//
+//	if (flags & (1 << 3)) {
+//	    return step();
+//	} else {
+//	    return other();
+//	}
+//
+// exercising liftCondition's "tbnz" handling: unlike cbz/cbnz (which
+// test a whole register against zero) or b.cond (which reads a
+// preceding cmp), tbz/tbnz test a single bit of their own register
+// operand directly.
+func TestLiftFunction_TestBitBranch(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// tbnz w0, #3, then(0xc)   (branch-taken: bit 3 set -> then)
+		{Address: 0x0, Size: 4, Mnemonic: "tbnz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 3},
+			{Type: native.OperandImm, Imm: 0xc},
+		}},
+		// else @ 0x4: bl other(0x200); ret
+		{Address: 0x4, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x200},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+		// then @ 0xc: bl step(0x100); ret
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		{Address: 0x10, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step", true
+		case 0x200:
+			return "other", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+	if len(stmts) != 1 {
+		t.Fatalf("expected exactly 1 top-level statement (the if), got %v", stmts)
+	}
+	ifStmt, ok := stmts[0].(*ir.IfStmt)
+	if !ok {
+		t.Fatalf("expected an IfStmt, got %T: %v", stmts[0], stmts[0])
+	}
+
+	neq, ok := ifStmt.Cond.(*ir.BinaryExpr)
+	if !ok || neq.Op != "!=" {
+		t.Fatalf("expected cond to be a \"!=\" comparison, got %#v", ifStmt.Cond)
+	}
+	masked, ok := neq.Left.(*ir.BinaryExpr)
+	if !ok || masked.Op != "&" {
+		t.Fatalf("expected the left side to be a \"&\" bit-mask expression, got %#v", neq.Left)
+	}
+	if lit, ok := masked.Right.(*ir.IntLit); !ok || lit.Value != 1<<3 {
+		t.Errorf("expected the mask to be 1<<3 = 8, got %#v", masked.Right)
+	}
+
+	requireReturnedCall := func(t *testing.T, block *ir.Block, wantMethod string) {
+		t.Helper()
+		if block == nil || len(block.Statements) != 1 {
+			t.Fatalf("expected exactly 1 statement, got %v", block)
+		}
+		ret, ok := block.Statements[0].(*ir.ReturnStmt)
+		if !ok {
+			t.Fatalf("expected a ReturnStmt, got %T: %v", block.Statements[0], block.Statements[0])
+		}
+		call, ok := ret.Value.(*ir.StaticMethodCall)
+		if !ok || call.Method != wantMethod {
+			t.Errorf("expected a call to %q, got %#v", wantMethod, ret.Value)
+		}
+	}
+	requireReturnedCall(t, ifStmt.Then, "step")
+	requireReturnedCall(t, ifStmt.Else, "other")
+}

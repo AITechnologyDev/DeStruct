@@ -140,8 +140,9 @@ func branchTarget(inst native.DetailedInstruction) (uint64, bool) {
 		return 0, false
 	}
 	// The target is always the LAST operand: "b"/"b.cond" have exactly
-	// one (the target itself), while "cbz"/"cbnz" put it after the
-	// tested register ("cbz Rt, #target").
+	// one (the target itself), "cbz"/"cbnz" put it after the tested
+	// register ("cbz Rt, #target"), and "tbz"/"tbnz" put it after both
+	// the tested register and the bit index ("tbz Rt, #bit, #target").
 	last := inst.Operands[len(inst.Operands)-1]
 	if last.Type != native.OperandImm {
 		return 0, false
@@ -166,15 +167,17 @@ func isAnyBranch(inst native.DetailedInstruction) bool {
 // isConditionalBranch reports whether inst is a conditional branch:
 // either "b.cond" (Capstone folds the ARM64 condition code into the
 // mnemonic string itself, as "b.eq", "b.le", "b.gt", ... - not a
-// separate operand or field), or "cbz"/"cbnz" (branch if a register
+// separate operand or field), "cbz"/"cbnz" (branch if a register
 // is/isn't zero - the single most common -O0 idiom for a null/zero
 // check or a simple loop counter test, compiled directly from the
-// comparison rather than via a separate "cmp" - see liftCondition's
-// own handling of these two). "tbz"/"tbnz" (test a single bit) are
-// NOT yet recognized - see the TODO at the bottom of this file.
+// comparison rather than via a separate "cmp"), or "tbz"/"tbnz"
+// (branch if a single bit of a register is/isn't set - the standard
+// -O0 idiom for testing one flag bit, e.g. "if (flags & (1 << 3))",
+// without needing a separate "and"+"cmp" pair) - see liftCondition's
+// own handling of all three.
 func isConditionalBranch(inst native.DetailedInstruction) bool {
 	switch inst.Mnemonic {
-	case "cbz", "cbnz":
+	case "cbz", "cbnz", "tbz", "tbnz":
 		return true
 	}
 	return len(inst.Mnemonic) > 2 && inst.Mnemonic[0] == 'b' && inst.Mnemonic[1] == '.'
@@ -525,6 +528,24 @@ func (l *lifter) liftCondition(inst native.DetailedInstruction) ir.Expr {
 			op = "!="
 		}
 		return &ir.BinaryExpr{Op: op, Left: val, Right: &ir.IntLit{Value: 0}}
+	case "tbz", "tbnz":
+		// Like cbz/cbnz, tbz/tbnz test their own operand directly -
+		// no preceding "cmp" to read - but only a single bit of it
+		// ("tbz Rt, #bit, #target": branch when bit #bit of Rt is
+		// clear; tbnz when it's set), lifted as the same bit-test
+		// expression a real "if (x & (1 << bit))" would use in C.
+		if len(inst.Operands) < 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandImm {
+			return &ir.LocalVar{Name: "cond"}
+		}
+		val := l.regValue(inst.Operands[0].Reg)
+		l.consume(val)
+		bit := &ir.IntLit{Value: 1 << uint(inst.Operands[1].Imm)}
+		masked := &ir.BinaryExpr{Op: "&", Left: val, Right: bit}
+		op := "=="
+		if inst.Mnemonic == "tbnz" {
+			op = "!="
+		}
+		return &ir.BinaryExpr{Op: op, Left: masked, Right: &ir.IntLit{Value: 0}}
 	}
 
 	// b.cond: the comparison operands come from whatever "cmp"
@@ -1471,12 +1492,12 @@ func (l *lifter) liftRet() ir.Stmt {
 // TODO(next iterations): calls, comparisons/if-else, generic mov,
 // void-call statement emission, adrp/adr string-literal resolution,
 // ldr-through-GOT global-object resolution, and plain single-condition
-// "while (cond) { straight-line body }" loops (cmp+b.cond or cbz/cbnz)
-// are now handled (see liftCall/liftMov/flushRemaining, liftAddr/
-// buildCall's StringResolver use, liftLdr's addrRegs+resolver use with
-// ELFParser.ResolveGOT, and tryLiftWhileLoop/findLoopBody). Remaining
-// growth areas, roughly in order of how often real-world -O0 code
-// needs them:
+// "while (cond) { straight-line body }" loops (cmp+b.cond, cbz/cbnz,
+// or tbz/tbnz) are now handled (see liftCall/liftMov/flushRemaining,
+// liftAddr/buildCall's StringResolver use, liftLdr's addrRegs+resolver
+// use with ELFParser.ResolveGOT, and tryLiftWhileLoop/findLoopBody).
+// Remaining growth areas, roughly in order of how often real-world -O0
+// code needs them:
 //   - Loop bodies containing their own nested control flow (an if, a
 //     break/continue, a nested loop) - findLoopBody currently bails
 //     out the instant any block in the candidate body chain has its
@@ -1487,8 +1508,6 @@ func (l *lifter) liftRet() ir.Stmt {
 //     condition check is the LAST block of the body rather than the
 //     first (this iteration only recognizes the condition-first
 //     "while" shape).
-//   - tbz/tbnz (test a single bit and branch) - structurally like
-//     cbz/cbnz (see isConditionalBranch) but not yet recognized.
 //   - More ALU ops (sub/mul/and/orr/eor/...).
 //   - Non-parameter stack locals (regular local variables, not just
 //     spilled parameters), and loads/stores to non-stack memory (real
