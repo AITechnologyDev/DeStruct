@@ -942,3 +942,129 @@ func TestLiftFunction_DoWhileLoopMultiBlockBody(t *testing.T) {
 		t.Errorf("expected the second call to be \"other\", got %#v", second.Expr)
 	}
 }
+
+// TestLiftFunction_DoWhileLoopWithInternalIfElse lifts a hand-built
+// instruction stream equivalent to:
+//
+//	int count(int n) {
+//	    int i = 0;
+//	    do {
+//	        if (w3 == 0) {
+//	            other();
+//	        } else {
+//	            step();
+//	        }
+//	        i = i + 1;
+//	    } while (i < n);
+//	    return n;
+//	}
+//
+// exercising the do-while body's own internal if/else, whose two arms
+// both reconverge at the tail (add+cmp+b.lt) before it - the ambiguous
+// shape tryLiftDoWhileLoop's own "both arms loop back" case exists for
+// (see its doc comment), and findDoWhileTail's own BFS locating the
+// tail past an ordinary conditional rather than being fooled by it.
+func TestLiftFunction_DoWhileLoopWithInternalIfElse(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// mov w2, #0              (i = 0)
+		{Address: 0x0, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		// mov w1, w0              (save n - see
+		// TestLiftFunction_DoWhileLoop's own note on why w0 can't be
+		// used directly once the body calls into anything)
+		{Address: 0x4, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandReg, Reg: "w0"},
+		}},
+		// bodyStart @ 0x8: cbz w3, else(0x14)
+		{Address: 0x8, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w3"},
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// @ 0xc: bl step(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// @ 0x10: b merge(0x18)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// else @ 0x14: bl other(0x104)
+		{Address: 0x14, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		// merge/tail @ 0x18: add w2, w2, #1
+		{Address: 0x18, Size: 4, Mnemonic: "add", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 1},
+		}},
+		// cmp w2, w1
+		{Address: 0x1c, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w1"},
+		}},
+		// b.lt bodyStart(0x8)
+		{Address: 0x20, Size: 4, Mnemonic: "b.lt", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x8},
+		}},
+		// exit @ 0x24: ret
+		{Address: 0x24, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step", true
+		case 0x104:
+			return "other", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"n"}, resolver, nil)
+
+	var do *ir.DoWhileStmt
+	for _, s := range stmts {
+		if v, ok := s.(*ir.DoWhileStmt); ok {
+			do = v
+		}
+	}
+	if do == nil {
+		t.Fatalf("expected a DoWhileStmt among the top-level statements, got %v", stmts)
+	}
+	cmp, ok := do.Cond.(*ir.BinaryExpr)
+	if !ok || cmp.Op != "<" {
+		t.Fatalf("expected cond to be a \"<\" comparison, got %#v", do.Cond)
+	}
+
+	if do.Body == nil || len(do.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the loop body (the internal if/else), got %v", do.Body)
+	}
+	ifStmt, ok := do.Body.Statements[0].(*ir.IfStmt)
+	if !ok {
+		t.Fatalf("expected the body statement to be an IfStmt, got %T: %v", do.Body.Statements[0], do.Body.Statements[0])
+	}
+
+	assertSingleCall := func(t *testing.T, stmts []ir.Stmt, method string) {
+		t.Helper()
+		if len(stmts) != 1 {
+			t.Fatalf("expected exactly 1 statement, got %v", stmts)
+		}
+		exprStmt, ok := stmts[0].(*ir.ExprStmt)
+		if !ok {
+			t.Fatalf("expected an ExprStmt, got %T: %v", stmts[0], stmts[0])
+		}
+		if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); !ok || call.Method != method {
+			t.Errorf("expected a call to %q, got %#v", method, exprStmt.Expr)
+		}
+	}
+	// Then corresponds to the branch-taken arm (cbz's target, 0x14 -
+	// "other()"), Else to the fallthrough arm (0xc - "step()") - see
+	// liftCondition's own doc comment on why the branch-taken path is
+	// always the "then" as this lifter builds it.
+	assertSingleCall(t, ifStmt.Then.Statements, "other")
+	assertSingleCall(t, ifStmt.Else.Statements, "step")
+}
