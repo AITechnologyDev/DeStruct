@@ -1446,3 +1446,119 @@ func TestLiftFunction_PointerFieldLoadPreservesUnusedCall(t *testing.T) {
 		t.Errorf("expected other() to appear somewhere among the top-level statements, got %v", stmts)
 	}
 }
+
+// TestLiftFunction_CompoundOrConditionThreeDeep lifts a hand-built
+// instruction stream equivalent to:
+//
+//	while (a != 0 || b != 0 || c != 0) {
+//	    step();
+//	}
+//
+// exercising tryOrChainLink's own recursive case: h2 (testing b) is
+// itself ambiguous from h1's perspective (BOTH of its arms eventually
+// reach back to h1 - one via h3, one via a trampoline straight into
+// the body), the exact shape that needs tryOrChainLink to recurse into
+// h3 rather than stopping at one extra link. h2's own "keep testing"
+// arm (to h3) is tried AFTER its own "enter the body" arm (a
+// trampoline block, correctly rejected immediately for having no
+// conditional branch of its own - isPlainConditionLink's own len==1
+// check alone isn't enough; tryOrChainLink's guard also requires
+// LastCond != nil), mirroring the real, more common compiled
+// orientation this project's other OR tests already document.
+func TestLiftFunction_CompoundOrConditionThreeDeep(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// h1 @ 0x0: cbnz a, body(0x14)
+		{Address: 0x0, Size: 4, Mnemonic: "cbnz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// h2 @ 0x4: cbz b, h3(0xc)
+		{Address: 0x4, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandImm, Imm: 0xc},
+		}},
+		// trampoline1 @ 0x8: b body(0x14)
+		{Address: 0x8, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// h3 @ 0xc: cbz c, exit(0x1c)
+		{Address: 0xc, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0x1c},
+		}},
+		// trampoline2 @ 0x10: b body(0x14)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// body @ 0x14: bl step(0x100)
+		{Address: 0x14, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// @ 0x18: b h1(0x0)
+		{Address: 0x18, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x0},
+		}},
+		// exit @ 0x1c: ret
+		{Address: 0x1c, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+	stmts := LiftFunction(insns, []string{"a", "b", "c"}, resolver, nil)
+
+	var while *ir.WhileStmt
+	for _, s := range stmts {
+		if w, ok := s.(*ir.WhileStmt); ok {
+			while = w
+		}
+	}
+	if while == nil {
+		t.Fatalf("expected a single WhileStmt (the 3-deep \"||\" chain folded together) among the top-level statements, got %v", stmts)
+	}
+
+	// (a != 0) || (!(b == 0) || !(c == 0)) - h1 (cbnz) lifts directly as
+	// "!=" (see liftCondition's own doc comment), but h2/h3 (cbz) are
+	// each folded in via tryOrChainLink's "eLoops && !tLoops" case
+	// (their OWN branch-taken arm is the one that DOESN'T continue the
+	// chain), which negates the raw branch-taken condition rather than
+	// restating it as "!=" directly.
+	outer, ok := while.Cond.(*ir.BinaryExpr)
+	if !ok || outer.Op != "||" {
+		t.Fatalf("expected cond to be a \"||\" expression, got %#v", while.Cond)
+	}
+	outerLeft, ok := outer.Left.(*ir.BinaryExpr)
+	if !ok || outerLeft.Op != "!=" {
+		t.Fatalf("expected the outer left side to be a \"!=\" comparison (a's own test), got %#v", outer.Left)
+	}
+	inner, ok := outer.Right.(*ir.BinaryExpr)
+	if !ok || inner.Op != "||" {
+		t.Fatalf("expected the outer right side to be a nested \"||\" expression (b's and c's tests), got %#v", outer.Right)
+	}
+	assertNegatedEquals := func(t *testing.T, e ir.Expr, label string) {
+		t.Helper()
+		neg, ok := e.(*ir.UnaryExpr)
+		if !ok || neg.Op != "!" {
+			t.Errorf("expected %s to be a negated (\"!\") expression, got %#v", label, e)
+			return
+		}
+		if cmp, ok := neg.Expr.(*ir.BinaryExpr); !ok || cmp.Op != "==" {
+			t.Errorf("expected %s's negated expression to be an \"==\" comparison, got %#v", label, neg.Expr)
+		}
+	}
+	assertNegatedEquals(t, inner.Left, "the inner left side (b's own test)")
+	assertNegatedEquals(t, inner.Right, "the inner right side (c's own test)")
+
+	if while.Body == nil || len(while.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the loop body (the flushed step() call), got %v", while.Body)
+	}
+	exprStmt, ok := while.Body.Statements[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the body statement to be an ExprStmt, got %T: %v", while.Body.Statements[0], while.Body.Statements[0])
+	}
+	if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected a call to \"step\", got %#v", exprStmt.Expr)
+	}
+}

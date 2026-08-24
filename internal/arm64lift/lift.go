@@ -619,34 +619,46 @@ func isPlainConditionLink(blk *BasicBlock) bool {
 	}
 }
 
-// tryOrChainLink attempts to extend a short-circuit "a || b" (or
-// "!a || b", depending on which of tryLiftWhileLoop's two successors
-// this is tried for) while-condition by treating addr as one more
-// condition test: addr must be a fresh isPlainConditionLink block
-// whose own two successors split cleanly into "reaches back to
-// headAddr" (continuing the loop - either straight into the real
-// body, or, in a 3+-deep chain, into yet another link this function
-// does NOT itself recurse into - see below) and "does not" (a
-// candidate real exit) - the exact same non-ambiguous shape
-// tryLiftWhileLoop's own first two cases already require, just
-// checked against addr instead of head.
+// tryOrChainLink attempts to extend a short-circuit "a || b (|| c ...)"
+// while-condition by treating addr as one more condition test: addr
+// must be a fresh isPlainConditionLink block whose own two successors
+// split cleanly into "reaches back to headAddr" (continuing the loop -
+// either straight into the real body, or into yet another link - see
+// below) and "does not" (a candidate real exit) - the exact same
+// non-ambiguous shape tryLiftWhileLoop's own first two cases already
+// require, just checked against addr instead of head.
 //
-// Only ONE extra link is ever attempted (no recursion): a 3+-deep
-// "a || b || c" chain would need addr's own "reaches back" successor
-// resolved the same ambiguous way tryLiftWhileLoop's caller already
-// tried once here, and doing that safely (without leaving partial
-// side effects from a failed deeper attempt on l, which isn't forked
-// for this speculative check) is more machinery than this iteration
-// spends on what's already a comparatively rare shape - it safely
-// falls back to ordinary if/else instead (still lossless, thanks to
-// liftBlockGraph's flush-on-already-visited handling).
+// A third possibility - BOTH of addr's own successors also reach back
+// to headAddr - means addr is itself just another ambiguous link in a
+// deeper chain (the exact shape that got tryLiftWhileLoop's caller
+// here in the first place), so this recurses into itself on addr's own
+// "reaches back" successor rather than giving up, extending the "||"
+// one level further - handling any chain depth, not just one extra
+// link, through repeated application of this same case. Tries addr's
+// own Succs[1] arm first (the far more common compiled orientation -
+// see tryLiftWhileLoop's own doc comment on why - then Succs[0]) at
+// every level, before concluding the chain doesn't extend cleanly from
+// here.
 //
-// Side effects (running addr's own instructions and lifting its
+// Falls back to ok=false whenever the shape doesn't hold at any level -
+// an irregular shape, a genuine body block, or simply nothing left to
+// find - so the caller (tryLiftWhileLoop, or this function's own
+// recursive caller one level up) falls back to treating the loop as an
+// ordinary if/else, always a safe default (never a wrong guess, and
+// never lossy: see liftBlockGraph's own flush-on-already-visited
+// handling).
+//
+// Side effects (running a link's own instructions and lifting its
 // condition, which can consume registers / touch l.lastCmp) only
-// happen once the shape is confirmed clean - never on a path that's
-// about to return ok=false - so a caller trying a second candidate
-// address after this one fails is never working with a
-// partially-mutated l.
+// happen once THAT link's shape is confirmed clean, working outward
+// from the deepest successful link back to the shallowest - never on a
+// path that's about to return ok=false - so a caller trying a second
+// candidate address after this one fails is never working with a
+// partially-mutated l. No explicit recursion-depth limit: an
+// arbitrarily long real "a || b || c || ..." chain is just as valid to
+// recognize as a short one, and l.budget (shared with every other
+// speculative search in this file - see reachesAddr's own doc comment)
+// already bounds the total work regardless of how deep this goes.
 func (l *lifter) tryOrChainLink(headAddr, addr uint64, byAddr map[uint64]*BasicBlock, outerLoop *loopCtx) (cond ir.Expr, bodyAddr, exitAddr uint64, ok bool) {
 	blk, exists := byAddr[addr]
 	if !exists || blk.LastCond == nil || len(blk.Succs) != 2 || !isPlainConditionLink(blk) {
@@ -662,6 +674,17 @@ func (l *lifter) tryOrChainLink(headAddr, addr uint64, byAddr map[uint64]*BasicB
 	case eLoops && !tLoops:
 		l.run(blk.Instructions[:len(blk.Instructions)-1])
 		return &ir.UnaryExpr{Op: "!", Expr: l.liftCondition(*blk.LastCond)}, e, t, true
+	case tLoops && eLoops:
+		if subCond, subBody, subExit, ok := l.tryOrChainLink(headAddr, e, byAddr, outerLoop); ok {
+			l.run(blk.Instructions[:len(blk.Instructions)-1])
+			return &ir.BinaryExpr{Op: "||", Left: l.liftCondition(*blk.LastCond), Right: subCond}, subBody, subExit, true
+		}
+		if subCond, subBody, subExit, ok := l.tryOrChainLink(headAddr, t, byAddr, outerLoop); ok {
+			l.run(blk.Instructions[:len(blk.Instructions)-1])
+			cond := &ir.UnaryExpr{Op: "!", Expr: l.liftCondition(*blk.LastCond)}
+			return &ir.BinaryExpr{Op: "||", Left: cond, Right: subCond}, subBody, subExit, true
+		}
+		return nil, 0, 0, false
 	default:
 		return nil, 0, 0, false
 	}
@@ -685,17 +708,19 @@ func (l *lifter) tryOrChainLink(headAddr, addr uint64, byAddr map[uint64]*BasicB
 // liftBlockGraph's own if/else case, which tries THIS function again
 // for it) - no special handling needed here at all.
 //
-// "a || b" is different: head's DIRECT short-circuit entry into the
-// body loops back just like the body itself does, so BOTH successors
-// satisfy reachesAddr, and tryOrChainLink is what disambiguates which
-// one is really "one more condition to fold in with ||" versus the
-// real body. If that fails too (an irregular shape, or a 3+-deep
-// "||" chain - see tryOrChainLink's own doc comment for why only one
-// extra link is attempted), this returns ok=false so the caller
-// (liftBlockGraph) falls back to treating it as an ordinary if/else -
-// always a safe default (never a wrong guess, and never lossy: see
-// liftBlockGraph's own flush-on-already-visited handling), just not
-// as pretty as a real "while" would be.
+// "a || b (|| c ...)" is different: head's DIRECT short-circuit entry
+// into the body loops back just like the body itself does, so BOTH
+// successors satisfy reachesAddr, and tryOrChainLink is what
+// disambiguates which one is really "one more condition to fold in
+// with ||" versus the real body - recursing into itself for a 3+-deep
+// chain (see its own doc comment), so any real chain depth folds into
+// a single "||"-chained condition here, not just one extra link. If
+// that fails too (an irregular shape this project doesn't otherwise
+// have a name for), this returns ok=false so the caller (liftBlockGraph)
+// falls back to treating it as an ordinary if/else - always a safe
+// default (never a wrong guess, and never lossy: see liftBlockGraph's
+// own flush-on-already-visited handling), just not as pretty as a real
+// "while" would be.
 //
 // outerLoop is whatever loop context liftBlockGraph itself was already
 // lifting inside of (nil at the top level) - threaded through to the
@@ -2202,49 +2227,35 @@ func (l *lifter) liftRet() ir.Stmt {
 	return &ir.ReturnStmt{Value: val}
 }
 
-// TODO(next iterations): calls, comparisons/if-else, generic mov,
-// void-call statement emission, adrp/adr string-literal resolution,
-// ldr-through-GOT global-object resolution, "while (cond) { body }"
-// loops (cmp+b.cond, cbz/cbnz, or tbz/tbnz) INCLUDING bodies with their
-// own nested if/else, break/continue, or nested loops, compound "&&"
-// conditions (these fall out of the nested-body handling for free -
-// see tryLiftWhileLoop's own doc comment) and one-link "||" conditions
-// (tryOrChainLink), more ALU/shift ops (sub/and/orr/eor/mul/lsl/lsr/
-// asr), and do/for-shaped ("condition last") loops INCLUDING bodies
-// with their own nested if/else, break/continue, or nested loops (see
-// findDoWhileTail's own doc comment for how it locates the tail
-// through arbitrary internal branching, and tryLiftDoWhileLoop's for
-// how it disambiguates a genuine do-while from an ordinary nested
-// "continue" inside an already-while-shaped loop) are now handled (see
-// liftCall/liftMov/flushRemaining, liftAddr/buildCall's StringResolver
-// use, liftLdr's addrRegs+resolver use with ELFParser.ResolveGOT,
-// tryLiftWhileLoop/reachesAddr/liftLoopEdge, liftALU, and
-// tryLiftDoWhileLoop/findDoWhileTail/liftDoWhileTail), non-parameter
-// stack locals - a store to a fresh stack slot that ISN'T a parameter's
-// own first spill is now a genuine local variable, named
-// deterministically from its displacement ("local_<disp>") and emitted
-// as a real AssignStmt (see liftStr's own doc comment, including a real
-// bug this fixed: reassigning a PARAMETER's own stack slot through the
-// same register used to spill it originally was indistinguishable from
-// the initial spill and silently dropped the reassignment entirely) -
-// and general (non-stack) memory access: "ldr"/"str" through any OTHER
-// base register (a struct field or array element access via an
-// arbitrary pointer, not just sp or a known GOT/data address) now
-// lifts to a real FieldAccess on whatever expression that register
-// currently holds, named deterministically from the displacement alone
-// ("field_<disp>") the same way a fresh stack local is, since there's
-// equally no debug info here to recover a real field name from (see
-// liftLdr/liftStr's own doc comments, including why the pointer
-// expression a LOAD reads is deliberately left unconsumed - unlike
-// every other value embedded into a larger expression in this file -
-// to avoid a real loss: if consuming it suppressed flushRemaining's
-// own fallback flush of a call the pointer's value came from, and the
-// resulting FieldAccess then went unused itself, that call's presence
-// would vanish from the output entirely). Remaining growth areas,
-// roughly in order of how often real-world -O0 code needs them:
-//   - A 3+-deep "||" chain ("a || b || c") - tryOrChainLink
-//     deliberately only ever resolves one extra link (see its own doc
-//     comment for why: avoiding partial side effects from a failed
-//     speculative deeper attempt on the shared, unforked lifter).
-//     Falls back to ordinary (still lossless) if/else, same as any
-//     other unrecognized shape.
+// TODO(next iterations): this lifter now handles - across many rounds,
+// see each function's own doc comment for the "why", not repeated here:
+// calls (liftCall/liftTailCall/buildCall/finishCall/flushRemaining),
+// if/else and while/do-while loops with arbitrary nested if/else,
+// break/continue, and nested loops (liftBlockGraph/tryLiftWhileLoop/
+// tryLiftDoWhileLoop/findDoWhileTail/liftDoWhileTail/liftLoopEdge),
+// compound "&&"/"||" conditions of any depth (tryOrChainLink),
+// adrp/adr string-literal and ldr-through-GOT global-object resolution
+// (liftAddr/ELFParser.ResolveGOT), the common ALU/shift ops
+// (liftAdd/liftALU), stack-spilled parameters AND ordinary local
+// variables (liftStr/liftLdr's stack-slot handling), and general
+// (non-stack) memory access - struct field/array element dereferences
+// through an arbitrary pointer (liftStr/liftLdr's FieldAccess
+// handling). Remaining known gaps, none narrow enough yet to single
+// out as "next":
+//   - No real type system: every value is an untyped IR expression, so
+//     a synthetic name like "field_8" or "local_16" is exactly that -
+//     synthetic, not a recovered field/variable name, and there's no
+//     way to tell an int from a pointer from a bool short of the
+//     surrounding operation's own shape.
+//   - Register-indexed ("[Rn, Rm]") and pre/post-indexed
+//     ("[Rn, #disp]!"/"[Rn], #disp") addressing aren't distinguished
+//     from plain offset addressing at all (native.MemOperand doesn't
+//     currently capture either) - real -O0 code mostly avoids both in
+//     favor of explicit address arithmetic, but when they do appear,
+//     a writeback's effect on the base register is silently unmodeled.
+//   - No real per-iteration dataflow/fixpoint analysis for loop bodies
+//     (see tryLiftWhileLoop's own doc comment) and no real merge-point
+//     /dominance analysis for if/else reconvergence (see
+//     liftBlockGraph's own doc comment) - both accepted, documented
+//     trade-offs of this lifter's per-fork, no-shared-state model
+//     rather than open gaps to close.
