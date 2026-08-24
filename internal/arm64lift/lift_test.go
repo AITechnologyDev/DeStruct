@@ -1068,3 +1068,176 @@ func TestLiftFunction_DoWhileLoopWithInternalIfElse(t *testing.T) {
 	assertSingleCall(t, ifStmt.Then.Statements, "other")
 	assertSingleCall(t, ifStmt.Else.Statements, "step")
 }
+
+// TestLiftFunction_ParamStackReassignment lifts a hand-built
+// instruction stream equivalent to:
+//
+//	int f(int n) {
+//	    n = n + 1;
+//	    return n;
+//	}
+//
+// exercising a real bug in an earlier version of liftStr: it matched a
+// store's source register by NAME (any "w0"-shaped register) rather
+// than by the VALUE currently in it, so re-storing n's own
+// already-reassigned register back to n's stack slot was
+// indistinguishable from the initial prologue spill and silently
+// dropped as "more of the same bookkeeping" - losing the "n = n + 1;"
+// assignment entirely and leaving the final reload (and thus the
+// return) reading n's STALE, pre-increment value.
+func TestLiftFunction_ParamStackReassignment(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// str w0, [sp, #12]   (prologue: spill n)
+		{Address: 0x0, Size: 4, Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "sp", Disp: 12}},
+		}},
+		// ldr w0, [sp, #12]   (reload n)
+		{Address: 0x4, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "sp", Disp: 12}},
+		}},
+		// add w0, w0, #1      (n + 1)
+		{Address: 0x8, Size: 4, Mnemonic: "add", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 1},
+		}},
+		// str w0, [sp, #12]   (n = n + 1 - a REAL reassignment)
+		{Address: 0xc, Size: 4, Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "sp", Disp: 12}},
+		}},
+		// ldr w0, [sp, #12]   (reload the reassigned n)
+		{Address: 0x10, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "sp", Disp: 12}},
+		}},
+		{Address: 0x14, Size: 4, Mnemonic: "ret"},
+	}
+
+	stmts := LiftFunction(insns, []string{"n"}, nil, nil)
+
+	var assign *ir.AssignStmt
+	var ret *ir.ReturnStmt
+	for _, s := range stmts {
+		switch v := s.(type) {
+		case *ir.AssignStmt:
+			assign = v
+		case *ir.ReturnStmt:
+			ret = v
+		}
+	}
+	if assign == nil {
+		t.Fatalf("expected an AssignStmt for \"n = n + 1\" among the top-level statements (it was previously silently dropped), got %v", stmts)
+	}
+	target, ok := assign.Target.(*ir.LocalVar)
+	if !ok || target.Name != "n" {
+		t.Errorf("expected the assignment's target to be local var \"n\", got %#v", assign.Target)
+	}
+	value, ok := assign.Value.(*ir.BinaryExpr)
+	if !ok || value.Op != "+" {
+		t.Fatalf("expected the assignment's value to be a \"+\" expression, got %#v", assign.Value)
+	}
+	if lhs, ok := value.Left.(*ir.LocalVar); !ok || lhs.Name != "n" {
+		t.Errorf("expected \"n + 1\"'s left side to be local var \"n\", got %#v", value.Left)
+	}
+
+	if ret == nil {
+		t.Fatalf("expected a ReturnStmt among the top-level statements, got %v", stmts)
+	}
+	retVal, ok := ret.Value.(*ir.LocalVar)
+	if !ok || retVal.Name != "n" {
+		t.Errorf("expected the return value to be local var \"n\" (the reassigned value, not a stale pre-increment one), got %#v", ret.Value)
+	}
+}
+
+// TestLiftFunction_NonParamStackLocal lifts a hand-built instruction
+// stream equivalent to:
+//
+//	int f() {
+//	    int total = step();
+//	    other();
+//	    return total;
+//	}
+//
+// exercising a genuine non-parameter local variable: step()'s result
+// is spilled to a fresh stack slot (not a parameter - the function
+// takes none), given a deterministic name derived from its stack
+// displacement, survives a second call that would otherwise clobber
+// the register it was originally computed into, and is correctly
+// reloaded by name rather than lost or conflated with anything else.
+func TestLiftFunction_NonParamStackLocal(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// bl step(0x100)
+		{Address: 0x0, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// str w0, [sp, #8]    (total = step())
+		{Address: 0x4, Size: 4, Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "sp", Disp: 8}},
+		}},
+		// bl other(0x104)
+		{Address: 0x8, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		// ldr w0, [sp, #8]    (reload total)
+		{Address: 0xc, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "sp", Disp: 8}},
+		}},
+		{Address: 0x10, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step", true
+		case 0x104:
+			return "other", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+
+	var assign *ir.AssignStmt
+	var otherCall *ir.ExprStmt
+	var ret *ir.ReturnStmt
+	for _, s := range stmts {
+		switch v := s.(type) {
+		case *ir.AssignStmt:
+			assign = v
+		case *ir.ExprStmt:
+			otherCall = v
+		case *ir.ReturnStmt:
+			ret = v
+		}
+	}
+	if assign == nil {
+		t.Fatalf("expected an AssignStmt for \"total = step()\" among the top-level statements, got %v", stmts)
+	}
+	target, ok := assign.Target.(*ir.LocalVar)
+	if !ok {
+		t.Fatalf("expected the assignment's target to be a LocalVar, got %#v", assign.Target)
+	}
+	if call, ok := assign.Value.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected the assignment's value to be a call to \"step\", got %#v", assign.Value)
+	}
+
+	if otherCall == nil {
+		t.Fatalf("expected an ExprStmt for the flushed other() call among the top-level statements, got %v", stmts)
+	}
+	if call, ok := otherCall.Expr.(*ir.StaticMethodCall); !ok || call.Method != "other" {
+		t.Errorf("expected a call to \"other\", got %#v", otherCall.Expr)
+	}
+
+	if ret == nil {
+		t.Fatalf("expected a ReturnStmt among the top-level statements, got %v", stmts)
+	}
+	retVal, ok := ret.Value.(*ir.LocalVar)
+	if !ok || retVal.Name != target.Name {
+		t.Errorf("expected the return value to be the SAME local var the assignment targeted (%q), got %#v", target.Name, ret.Value)
+	}
+}

@@ -1250,6 +1250,22 @@ func (l *lifter) paramNameForReg(reg string) (string, bool) {
 	return "", false
 }
 
+// isParam reports whether name is one of this function's own declared
+// parameter names - used by liftStr to tell a genuine prologue spill
+// (a parameter's own, unmodified value reaching the stack for the
+// first time) apart from an ordinary local variable's assignment, by
+// the VALUE currently in the source register rather than merely which
+// register it happens to be (see liftStr's own doc comment for why
+// that distinction matters).
+func (l *lifter) isParam(name string) bool {
+	for _, p := range l.params {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}
+
 // seedParams initializes each declared parameter's home register(s) to
 // an IR reference to that parameter's name - this is what lets a
 // prologue's "str w0, [sp, #12]" (spilling the first parameter to the
@@ -1328,7 +1344,7 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			}
 			stmts = append(stmts, l.liftMov(inst)...)
 		case "str":
-			l.liftStr(inst)
+			stmts = append(stmts, l.liftStr(inst)...)
 		case "ldr":
 			stmts = append(stmts, l.liftLdr(inst)...)
 		case "cmp":
@@ -1424,34 +1440,58 @@ func isFramePointerEstablish(inst native.DetailedInstruction) bool {
 	return inst.Operands[1].Type == native.OperandReg && inst.Operands[1].Reg == "sp"
 }
 
-// liftStr lifts "str Rt, [Rn, #disp]" - a store to memory. The only
-// shape currently recognized is spilling a parameter-carrying register
-// to a stack slot (the -O0 prologue pattern of copying each incoming
-// argument register to its own stack slot immediately on function
-// entry, so the register itself is free to be reused later) - which
-// isn't lifted into a memory-store statement at all, since it has no
-// source-level equivalent; it just teaches the lifter that this stack
-// slot means this parameter, so a later "ldr" from the same slot
-// resolves back to it (see liftLdr).
-func (l *lifter) liftStr(inst native.DetailedInstruction) {
+// liftStr lifts "str Rt, [sp, #disp]" - a store to a stack slot. Two
+// shapes:
+//
+//   - The FIRST store to a fresh slot, where Rt currently holds one of
+//     this function's own parameters (checked by the VALUE currently
+//     in Rt via regValue/isParam, not merely by which physical
+//     register Rt happens to be - unlike an early version of this
+//     check, which matched on the register name alone and could
+//     therefore mistake a later, genuine reassignment through that
+//     same register for another silent spill, silently dropping it -
+//     see below): the standard -O0 prologue pattern of copying each
+//     incoming argument register to its own stack slot immediately on
+//     entry. Pure bookkeeping with no source-level equivalent - lifted
+//     silently (no statement); it just teaches the lifter that this
+//     slot means this parameter, so a later "ldr" from the same slot
+//     resolves back to it (see liftLdr).
+//   - Anything else is a genuine source-level assignment: either the
+//     first store to a fresh slot (a new local variable's own
+//     initialization - named deterministically from its stack
+//     displacement, "local_<disp>", so independent forks that each
+//     discover the same slot fresh - see fork's own doc comment on why
+//     the stack map isn't shared across forks - agree on the same
+//     name without needing to coordinate) or a later store to an
+//     already-named slot (reassigning that local, or even a parameter
+//     whose value has since changed via that same slot, e.g. "n = n +
+//     1;" spilled back to n's own stack home). Lifted as an ordinary
+//     AssignStmt.
+func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 2 {
-		return
+		return nil
 	}
 	srcOp, dstOp := inst.Operands[0], inst.Operands[1]
 	if srcOp.Type != native.OperandReg || dstOp.Type != native.OperandMem {
-		return
+		return nil
 	}
 	if dstOp.Mem.Base != "sp" || dstOp.Mem.Index != "" {
-		return
+		return nil
 	}
+	disp := dstOp.Mem.Disp
+	srcVal := l.regValue(srcOp.Reg)
 
-	if name, ok := l.paramNameForReg(srcOp.Reg); ok {
-		l.stack[dstOp.Mem.Disp] = name
+	name, exists := l.stack[disp]
+	if !exists {
+		if lv, ok := srcVal.(*ir.LocalVar); ok && l.isParam(lv.Name) {
+			l.stack[disp] = lv.Name
+			return nil
+		}
+		name = fmt.Sprintf("local_%d", disp)
+		l.stack[disp] = name
 	}
-	// A store of anything else (a non-parameter register, or to a slot
-	// not otherwise recognized) isn't lifted yet - falls through with
-	// no effect, which is safe (produces no statement) but incomplete;
-	// see the TODO at the bottom of this file.
+	l.consume(srcVal)
+	return []ir.Stmt{&ir.AssignStmt{Target: &ir.LocalVar{Name: name}, Value: srcVal}}
 }
 
 // liftLdr lifts "ldr Rt, [Rn, #disp]" - a load from memory. The only
@@ -2120,15 +2160,33 @@ func (l *lifter) liftRet() ir.Stmt {
 // liftCall/liftMov/flushRemaining, liftAddr/buildCall's StringResolver
 // use, liftLdr's addrRegs+resolver use with ELFParser.ResolveGOT,
 // tryLiftWhileLoop/reachesAddr/liftLoopEdge, liftALU, and
-// tryLiftDoWhileLoop/findDoWhileTail/liftDoWhileTail). Remaining growth
-// areas, roughly in order of how often real-world -O0 code needs them:
+// tryLiftDoWhileLoop/findDoWhileTail/liftDoWhileTail), and non-parameter
+// stack locals - a store to a fresh stack slot that ISN'T a parameter's
+// own first spill is now a genuine local variable, named
+// deterministically from its displacement ("local_<disp>") and emitted
+// as a real AssignStmt (see liftStr's own doc comment, including a real
+// bug this fixed: reassigning a PARAMETER's own stack slot through the
+// same register used to spill it originally was indistinguishable from
+// the initial spill and silently dropped the reassignment entirely).
+// Remaining growth areas, roughly in order of how often real-world -O0
+// code needs them:
 //   - A 3+-deep "||" chain ("a || b || c") - tryOrChainLink
 //     deliberately only ever resolves one extra link (see its own doc
 //     comment for why: avoiding partial side effects from a failed
 //     speculative deeper attempt on the shared, unforked lifter).
 //     Falls back to ordinary (still lossless) if/else, same as any
 //     other unrecognized shape.
-//   - Non-parameter stack locals (regular local variables, not just
-//     spilled parameters), and loads/stores to non-stack memory (real
-//     pointer dereferences, not just the stack-slot bookkeeping this
-//     version does).
+//   - Loads/stores to non-stack memory (real pointer dereferences -
+//     "ldr Rt, [Rn, #disp]"/"str Rt, [Rn, #disp]" where Rn isn't sp and
+//     doesn't resolve through addrRegs to a known symbol, e.g. a
+//     struct field or array element access through an arbitrary
+//     pointer). liftLdr currently just clobbers the destination
+//     register for this shape, and liftStr drops the store entirely
+//     (dstOp.Mem.Base != "sp" returns early with no effect at all) -
+//     unlike a stack slot, there's no simple integer key (a
+//     displacement alone) to name a slot by, since the SAME pointer
+//     value can arrive in different registers across different paths;
+//     doing this properly needs real pointer-expression tracking (e.g.
+//     rendering "Rn->field_<disp>" keyed by the pointer's own IR
+//     expression identity, not just a register name), which is a
+//     meaningfully bigger step than the stack-local case above.
