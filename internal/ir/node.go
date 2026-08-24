@@ -158,6 +158,22 @@ type (
 	ExprStmt struct {
 		Expr Expr
 	}
+	// SuperCallStmt is an explicit "super(args);" - a constructor's own
+	// invokespecial <init> call targeting its SUPERCLASS's constructor
+	// (as opposed to ThisCallStmt below, targeting its OWN class). Every
+	// constructor's bytecode begins with exactly one of these two (javac
+	// inserts an implicit no-arg one when the source doesn't write
+	// either explicitly), so a decompiled constructor's own Body always
+	// starts with one.
+	SuperCallStmt struct {
+		Args []Expr
+	}
+	// ThisCallStmt is an explicit "this(args);" - one constructor
+	// overload delegating to another in the SAME class. See
+	// SuperCallStmt's own doc comment.
+	ThisCallStmt struct {
+		Args []Expr
+	}
 	IfStmt struct {
 		Cond Expr
 		Then *Block
@@ -241,21 +257,23 @@ type (
 	ContinueStmt struct{}
 )
 
-func (*AssignStmt) stmtNode()   {}
-func (*ReturnStmt) stmtNode()   {}
-func (*ExprStmt) stmtNode()     {}
-func (*IfStmt) stmtNode()       {}
-func (*WhileStmt) stmtNode()    {}
-func (*DoWhileStmt) stmtNode()  {}
-func (*ForStmt) stmtNode()      {}
-func (*SwitchStmt) stmtNode()   {}
-func (*TryStmt) stmtNode()      {}
-func (*ForEachStmt) stmtNode()  {}
-func (*BlockStmt) stmtNode()    {}
-func (*ThrowStmt) stmtNode()    {}
-func (*VarDeclStmt) stmtNode()  {}
-func (*BreakStmt) stmtNode()    {}
-func (*ContinueStmt) stmtNode() {}
+func (*AssignStmt) stmtNode()    {}
+func (*ReturnStmt) stmtNode()    {}
+func (*ExprStmt) stmtNode()      {}
+func (*SuperCallStmt) stmtNode() {}
+func (*ThisCallStmt) stmtNode()  {}
+func (*IfStmt) stmtNode()        {}
+func (*WhileStmt) stmtNode()     {}
+func (*DoWhileStmt) stmtNode()   {}
+func (*ForStmt) stmtNode()       {}
+func (*SwitchStmt) stmtNode()    {}
+func (*TryStmt) stmtNode()       {}
+func (*ForEachStmt) stmtNode()   {}
+func (*BlockStmt) stmtNode()     {}
+func (*ThrowStmt) stmtNode()     {}
+func (*VarDeclStmt) stmtNode()   {}
+func (*BreakStmt) stmtNode()     {}
+func (*ContinueStmt) stmtNode()  {}
 
 type (
 	IntLit    struct{ Value int64 }

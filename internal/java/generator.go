@@ -120,6 +120,41 @@ func (g *Generator) generateClass(class *ir.Class) error {
 			}
 			return false
 		},
+		// ctorCall renders a constructor's own leading super(...)/
+		// this(...) call - decompileInvoke (internal/jvm/decoder.go)
+		// always makes this the first statement of a constructor's own
+		// Body, since every real constructor's bytecode begins with
+		// exactly one of these (javac inserts an implicit no-arg
+		// super() when the source doesn't write either explicitly).
+		// Falls back to a bare "super();" only as a defensive default
+		// for a Body that doesn't start with one (shouldn't happen for
+		// a genuine constructor, but safer than a panic on unexpected
+		// input).
+		"ctorCall": func(m *ir.Method) string {
+			if m.Body != nil && len(m.Body.Statements) > 0 {
+				switch m.Body.Statements[0].(type) {
+				case *ir.SuperCallStmt, *ir.ThisCallStmt:
+					return fmt.Sprint(m.Body.Statements[0])
+				}
+			}
+			return "super();"
+		},
+		// ctorBodyStatements returns a constructor's own body
+		// statements MINUS the leading super(...)/this(...) call
+		// ctorCall above already renders - avoids rendering it twice.
+		"ctorBodyStatements": func(m *ir.Method) []ir.Stmt {
+			if m.Body == nil {
+				return nil
+			}
+			stmts := m.Body.Statements
+			if len(stmts) > 0 {
+				switch stmts[0].(type) {
+				case *ir.SuperCallStmt, *ir.ThisCallStmt:
+					return stmts[1:]
+				}
+			}
+			return stmts
+		},
 		"renderStmt": func(s ir.Stmt) string {
 			return renderStmt(s, 2)
 		},
@@ -626,6 +661,14 @@ func collectImports(class *ir.Class) []string {
 			}
 		case *ir.ExprStmt:
 			walkExpr(v.Expr)
+		case *ir.SuperCallStmt:
+			for _, arg := range v.Args {
+				walkExpr(arg)
+			}
+		case *ir.ThisCallStmt:
+			for _, arg := range v.Args {
+				walkExpr(arg)
+			}
 		case *ir.TryStmt:
 			for _, r := range v.Resources {
 				walkType(r.VarType)
@@ -690,9 +733,9 @@ const javaTemplate = `{{- if .Package}}package {{.Package}};
 {{- range .Methods}}
 {{- if eq .Name "<init>"}}
 	{{acc .Access}}{{$.Name}}({{params .Params}}) {
-		super();
-{{- if .Body}}{{range .Body.Statements}}{{- if not (isReturnVoid .)}}
-		{{.}}{{- end}}{{- end}}{{- end}}
+		{{ctorCall .}}
+{{- range ctorBodyStatements .}}{{- if not (isReturnVoid .)}}
+		{{.}}{{- end}}{{- end}}
 	}
 {{- else if eq .Name "<clinit>"}}
 	static {

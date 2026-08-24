@@ -127,3 +127,122 @@ func TestGenerateClass_OrdinaryMethodStillGetsBody(t *testing.T) {
 		t.Errorf("expected the \"// TODO\" placeholder for a genuinely undecompiled ordinary method, got:\n%s", src)
 	}
 }
+
+// TestGenerateClass_SuperCallWithArgs exercises the actual bug: a
+// constructor whose superclass constructor call carries real arguments
+// (e.g. a View subclass forwarding its own Context/AttributeSet
+// parameters to android.widget.EditText's constructor) must render
+// those arguments, not a bare "super();" that silently drops them.
+func TestGenerateClass_SuperCallWithArgs(t *testing.T) {
+	class := &ir.Class{
+		Name:       "Sample",
+		Access:     ir.AccPublic,
+		SuperClass: "android/widget/EditText",
+		Methods: []*ir.Method{
+			{
+				Name:   "<init>",
+				Access: ir.AccPublic,
+				Params: []*ir.Param{
+					{Name: "context", Type: &ir.ClassType{Name: "android.content.Context"}},
+				},
+				Body: &ir.Block{
+					Statements: []ir.Stmt{
+						&ir.SuperCallStmt{Args: []ir.Expr{&ir.LocalVar{Name: "context"}}},
+						&ir.ReturnStmt{},
+					},
+				},
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	g := NewGenerator(Options{OutputDir: dir})
+	if err := g.GenerateClass(class); err != nil {
+		t.Fatalf("GenerateClass: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "Sample.java"))
+	if err != nil {
+		t.Fatalf("reading generated file: %v", err)
+	}
+	src := string(data)
+
+	if !strings.Contains(src, "super(context);") {
+		t.Errorf("expected \"super(context);\" (the real forwarded argument, not dropped), got:\n%s", src)
+	}
+	if strings.Contains(src, "super();") {
+		t.Errorf("must not ALSO render a bare \"super();\" - the leading SuperCallStmt should be consumed exactly once, got:\n%s", src)
+	}
+}
+
+// TestGenerateClass_ThisCallWithArgs covers the sibling case: one
+// constructor overload delegating to another in the SAME class
+// ("this(...)"), which compiles to the identical invokespecial <init>
+// shape as a super() call and is only told apart by its target class
+// (see decompileInvoke's own doc comment in internal/jvm/decoder.go).
+func TestGenerateClass_ThisCallWithArgs(t *testing.T) {
+	class := &ir.Class{
+		Name:   "Sample",
+		Access: ir.AccPublic,
+		Methods: []*ir.Method{
+			{
+				Name:   "<init>",
+				Access: ir.AccPublic,
+				Body: &ir.Block{
+					Statements: []ir.Stmt{
+						&ir.ThisCallStmt{Args: []ir.Expr{&ir.IntLit{Value: 0}}},
+						&ir.ReturnStmt{},
+					},
+				},
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	g := NewGenerator(Options{OutputDir: dir})
+	if err := g.GenerateClass(class); err != nil {
+		t.Fatalf("GenerateClass: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "Sample.java"))
+	if err != nil {
+		t.Fatalf("reading generated file: %v", err)
+	}
+	src := string(data)
+
+	if !strings.Contains(src, "this(0);") {
+		t.Errorf("expected \"this(0);\", got:\n%s", src)
+	}
+}
+
+// TestGenerateClass_ImplicitSuperCall covers a constructor whose body
+// doesn't start with a SuperCallStmt/ThisCallStmt at all (defensive
+// fallback - shouldn't happen for a real decompiled constructor, since
+// decompileInvoke always produces one, but the template must still
+// degrade to a harmless bare "super();" rather than panicking or
+// emitting nothing).
+func TestGenerateClass_ImplicitSuperCall(t *testing.T) {
+	class := &ir.Class{
+		Name:   "Sample",
+		Access: ir.AccPublic,
+		Methods: []*ir.Method{
+			{Name: "<init>", Access: ir.AccPublic},
+		},
+	}
+
+	dir := t.TempDir()
+	g := NewGenerator(Options{OutputDir: dir})
+	if err := g.GenerateClass(class); err != nil {
+		t.Fatalf("GenerateClass: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "Sample.java"))
+	if err != nil {
+		t.Fatalf("reading generated file: %v", err)
+	}
+	src := string(data)
+
+	if !strings.Contains(src, "super();") {
+		t.Errorf("expected the defensive bare \"super();\" fallback, got:\n%s", src)
+	}
+}

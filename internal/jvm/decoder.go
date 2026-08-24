@@ -1028,7 +1028,28 @@ func decompileInvoke(cf *ClassFile, idx uint16, kind string, stack *exprStack) [
 				}
 			}
 			stack.push(ne)
+			return nil
 		}
+		// Not "new Foo(...)" construction - this invokespecial <init>
+		// is on "this" itself, from WITHIN a constructor: either
+		// chaining to another constructor in the SAME class
+		// ("this(...)") or invoking the superclass's own constructor
+		// ("super(...)"). Both compile to invokespecial <init> on
+		// "this" identically - kind alone can't tell them apart, only
+		// the target class can (the JVM only ever allows one of these
+		// two targets here, never an arbitrary ancestor, so "not this
+		// class" always means "the direct superclass").
+		if lv, ok := newObj.(*ir.LocalVar); ok && lv.Name == "this" {
+			if className == cf.GetThisClassName() {
+				return []ir.Stmt{&ir.ThisCallStmt{Args: args}}
+			}
+			return []ir.Stmt{&ir.SuperCallStmt{Args: args}}
+		}
+		// Anything else on the stack here is unexpected (a
+		// decompilation gap elsewhere left something odd behind) -
+		// silently dropping args, as before, is the safe fallback:
+		// there's no sound statement to build from an unrecognized
+		// receiver.
 		return nil
 	}
 

@@ -20,6 +20,22 @@ func (s *ExprStmt) String() string {
 	return fmt.Sprintf("%s;", s.Expr)
 }
 
+func (s *SuperCallStmt) String() string {
+	args := make([]string, len(s.Args))
+	for i, a := range s.Args {
+		args[i] = fmt.Sprint(a)
+	}
+	return fmt.Sprintf("super(%s);", strings.Join(args, ", "))
+}
+
+func (s *ThisCallStmt) String() string {
+	args := make([]string, len(s.Args))
+	for i, a := range s.Args {
+		args[i] = fmt.Sprint(a)
+	}
+	return fmt.Sprintf("this(%s);", strings.Join(args, ", "))
+}
+
 func (s *IfStmt) String() string {
 	if s.Else != nil && len(s.Else.Statements) > 0 {
 		return fmt.Sprintf("if (%s) { ... } else { ... }", s.Cond)

@@ -47,6 +47,10 @@ func CloneStmt(s Stmt) Stmt {
 		return &ReturnStmt{Value: CloneExpr(v.Value)}
 	case *ExprStmt:
 		return &ExprStmt{Expr: CloneExpr(v.Expr)}
+	case *SuperCallStmt:
+		return &SuperCallStmt{Args: cloneExprs(v.Args)}
+	case *ThisCallStmt:
+		return &ThisCallStmt{Args: cloneExprs(v.Args)}
 	case *IfStmt:
 		return &IfStmt{Cond: CloneExpr(v.Cond), Then: CloneBlock(v.Then), Else: CloneBlock(v.Else)}
 	case *WhileStmt:
