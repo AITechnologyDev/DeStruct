@@ -127,6 +127,12 @@ func printStmts(stmts []ir.Stmt, depth int) {
 				printStmts(v.Body.Statements, depth+1)
 			}
 			fmt.Printf("%s}\n", indent)
+		case *ir.DoWhileStmt:
+			fmt.Printf("%sdo {\n", indent)
+			if v.Body != nil {
+				printStmts(v.Body.Statements, depth+1)
+			}
+			fmt.Printf("%s} while (%s);\n", indent, v.Cond)
 		default:
 			fmt.Printf("%s%s\n", indent, s)
 		}

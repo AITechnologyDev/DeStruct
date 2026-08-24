@@ -31,6 +31,10 @@ func (s *WhileStmt) String() string {
 	return fmt.Sprintf("while (%s) { ... }", s.Cond)
 }
 
+func (s *DoWhileStmt) String() string {
+	return fmt.Sprintf("do { ... } while (%s);", s.Cond)
+}
+
 func (s *ForStmt) String() string {
 	return fmt.Sprintf("for (...; %s; ...) { ... }", s.Cond)
 }

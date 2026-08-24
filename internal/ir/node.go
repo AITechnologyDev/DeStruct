@@ -72,18 +72,18 @@ type Type interface {
 type AccessFlags uint16
 
 const (
-	AccPublic    AccessFlags = 0x0001
-	AccPrivate   AccessFlags = 0x0002
-	AccProtected AccessFlags = 0x0004
-	AccStatic    AccessFlags = 0x0008
-	AccFinal     AccessFlags = 0x0010
+	AccPublic       AccessFlags = 0x0001
+	AccPrivate      AccessFlags = 0x0002
+	AccProtected    AccessFlags = 0x0004
+	AccStatic       AccessFlags = 0x0008
+	AccFinal        AccessFlags = 0x0010
 	AccSynchronized AccessFlags = 0x0020
-	AccVolatile  AccessFlags = 0x0040
-	AccTransient AccessFlags = 0x0080
-	AccNative    AccessFlags = 0x0100
-	AccAbstract  AccessFlags = 0x0400
-	AccInterface AccessFlags = 0x0200
-	AccEnum      AccessFlags = 0x4000
+	AccVolatile     AccessFlags = 0x0040
+	AccTransient    AccessFlags = 0x0080
+	AccNative       AccessFlags = 0x0100
+	AccAbstract     AccessFlags = 0x0400
+	AccInterface    AccessFlags = 0x0200
+	AccEnum         AccessFlags = 0x4000
 )
 
 func (f AccessFlags) Has(flag AccessFlags) bool {
@@ -159,11 +159,18 @@ type (
 		Expr Expr
 	}
 	IfStmt struct {
-		Cond  Expr
-		Then  *Block
-		Else  *Block
+		Cond Expr
+		Then *Block
+		Else *Block
 	}
 	WhileStmt struct {
+		Cond Expr
+		Body *Block
+	}
+	// DoWhileStmt is a "do { body } while (cond);" loop: unlike
+	// WhileStmt, the condition is checked AFTER the body runs, so the
+	// body always executes at least once.
+	DoWhileStmt struct {
 		Cond Expr
 		Body *Block
 	}
@@ -174,8 +181,8 @@ type (
 		Body *Block
 	}
 	SwitchStmt struct {
-		Target Expr
-		Cases  []*CaseClause
+		Target  Expr
+		Cases   []*CaseClause
 		Default *Block
 	}
 	CaseClause struct {
@@ -196,10 +203,10 @@ type (
 		// nil/empty for an ordinary try. When present, these render as
 		// the parenthesized resource list rather than as ordinary
 		// statements inside Body.
-		Resources   []*ResourceDecl
-		Body        *Block
-		Catches     []*CatchClause
-		Finally     *Block
+		Resources []*ResourceDecl
+		Body      *Block
+		Catches   []*CatchClause
+		Finally   *Block
 	}
 	// ResourceDecl is one resource declaration in a try-with-resources
 	// statement's parentheses: "Type varName = initExpr".
@@ -230,24 +237,25 @@ type (
 		Type Type
 		Init Expr
 	}
-	BreakStmt struct{}
+	BreakStmt    struct{}
 	ContinueStmt struct{}
 )
 
-func (*AssignStmt) stmtNode()     {}
-func (*ReturnStmt) stmtNode()     {}
-func (*ExprStmt) stmtNode()       {}
-func (*IfStmt) stmtNode()         {}
-func (*WhileStmt) stmtNode()      {}
-func (*ForStmt) stmtNode()        {}
-func (*SwitchStmt) stmtNode()     {}
-func (*TryStmt) stmtNode()        {}
-func (*ForEachStmt) stmtNode()    {}
-func (*BlockStmt) stmtNode()      {}
-func (*ThrowStmt) stmtNode()      {}
-func (*VarDeclStmt) stmtNode()    {}
-func (*BreakStmt) stmtNode()      {}
-func (*ContinueStmt) stmtNode()   {}
+func (*AssignStmt) stmtNode()   {}
+func (*ReturnStmt) stmtNode()   {}
+func (*ExprStmt) stmtNode()     {}
+func (*IfStmt) stmtNode()       {}
+func (*WhileStmt) stmtNode()    {}
+func (*DoWhileStmt) stmtNode()  {}
+func (*ForStmt) stmtNode()      {}
+func (*SwitchStmt) stmtNode()   {}
+func (*TryStmt) stmtNode()      {}
+func (*ForEachStmt) stmtNode()  {}
+func (*BlockStmt) stmtNode()    {}
+func (*ThrowStmt) stmtNode()    {}
+func (*VarDeclStmt) stmtNode()  {}
+func (*BreakStmt) stmtNode()    {}
+func (*ContinueStmt) stmtNode() {}
 
 type (
 	IntLit    struct{ Value int64 }
@@ -258,15 +266,15 @@ type (
 	BoolLit   struct{ Value bool }
 	NullLit   struct{}
 
-	LocalVar struct{ Name string }
+	LocalVar    struct{ Name string }
 	FieldAccess struct {
 		Object Expr
 		Name   string
 	}
 	MethodCall struct {
-		Object   Expr
-		Name     string
-		Args     []Expr
+		Object Expr
+		Name   string
+		Args   []Expr
 	}
 	StaticMethodCall struct {
 		Class  string
@@ -293,11 +301,11 @@ type (
 		Type Type
 		Expr Expr
 	}
-	ThisExpr struct{}
-	SuperExpr struct{}
+	ThisExpr   struct{}
+	SuperExpr  struct{}
 	BinaryExpr struct {
-		Op   string
-		Left Expr
+		Op    string
+		Left  Expr
 		Right Expr
 	}
 	UnaryExpr struct {
@@ -310,7 +318,7 @@ type (
 		FalseExpr Expr
 	}
 	MethodRefExpr struct {
-		ClassName string
+		ClassName  string
 		MethodName string
 	}
 	// LambdaExpr represents an inline lambda expression, e.g. "(x) -> x.foo()"
@@ -350,6 +358,6 @@ func (*SuperExpr) exprNode()        {}
 func (*BinaryExpr) exprNode()       {}
 func (*UnaryExpr) exprNode()        {}
 func (*TernaryExpr) exprNode()      {}
-func (*MethodRefExpr) exprNode()     {}
-func (*LambdaExpr) exprNode()        {}
-func (*ClassLiteral) exprNode()      {}
+func (*MethodRefExpr) exprNode()    {}
+func (*LambdaExpr) exprNode()       {}
+func (*ClassLiteral) exprNode()     {}

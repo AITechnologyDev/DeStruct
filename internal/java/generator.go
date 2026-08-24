@@ -69,7 +69,7 @@ func (g *Generator) generateClass(class *ir.Class) error {
 	imports := collectImports(class)
 
 	tmpl, err := template.New("class").Funcs(template.FuncMap{
-		"acc": accessStr,
+		"acc":  accessStr,
 		"fmod": fieldModStr,
 		"mmod": methodModStr,
 		"typeName": func(t ir.Type) string {
@@ -277,6 +277,13 @@ func renderStmt(s ir.Stmt, depth int) string {
 			result += renderStmt(stmt, depth+1) + "\n"
 		}
 		result += indent + "}"
+		return result
+	case *ir.DoWhileStmt:
+		result := indent + "do {\n"
+		for _, stmt := range v.Body.Statements {
+			result += renderStmt(stmt, depth+1) + "\n"
+		}
+		result += indent + "} while (" + fmt.Sprint(v.Cond) + ");"
 		return result
 	case *ir.ForEachStmt:
 		result := indent + "for (" + typeName(v.VarType) + " " + v.VarName + " : " + fmt.Sprint(v.Expr) + ") {\n"
@@ -565,6 +572,13 @@ func collectImports(class *ir.Class) []string {
 				}
 			}
 		case *ir.WhileStmt:
+			walkExpr(v.Cond)
+			if v.Body != nil {
+				for _, stmt := range v.Body.Statements {
+					walkStmt(stmt)
+				}
+			}
+		case *ir.DoWhileStmt:
 			walkExpr(v.Cond)
 			if v.Body != nil {
 				for _, stmt := range v.Body.Statements {

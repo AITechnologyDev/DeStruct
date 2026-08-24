@@ -738,3 +738,207 @@ func TestLiftFunction_CompoundOrCondition(t *testing.T) {
 		t.Errorf("expected a call to \"step\", got %#v", exprStmt.Expr)
 	}
 }
+
+// TestLiftFunction_DoWhileLoop lifts a hand-built instruction stream
+// equivalent to the standard -O0 codegen for:
+//
+//	int count(int n) {
+//	    int i = 0;
+//	    do {
+//	        step();
+//	        i = i + 1;
+//	    } while (i < n);
+//	    return n;
+//	}
+//
+// exercising tryLiftDoWhileLoop's single-block case: since the body has
+// no branch of its own, buildCFG never splits it from the tail
+// condition check - "head" and "tail" are the very same block, whose
+// own conditional branch loops back to ITS OWN start address rather
+// than some earlier, already-lifted block (the while-shape case
+// tryLiftWhileLoop handles).
+func TestLiftFunction_DoWhileLoop(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// mov w2, #0             (i = 0)
+		{Address: 0x0, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		// mov w1, w0             (save n into w1 - w0 is call-clobbered,
+		// and the loop body below calls step() before the comparison
+		// that needs n, exactly like a real register allocator would
+		// have to arrange)
+		{Address: 0x4, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandReg, Reg: "w0"},
+		}},
+		// head/tail @ 0x8: bl step(0x100)
+		{Address: 0x8, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// add w2, w2, #1          (i = i + 1)
+		{Address: 0xc, Size: 4, Mnemonic: "add", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 1},
+		}},
+		// cmp w2, w1              (i - n)
+		{Address: 0x10, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w1"},
+		}},
+		// b.lt head(0x8)          (back-edge: taken when i < n)
+		{Address: 0x14, Size: 4, Mnemonic: "b.lt", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x8},
+		}},
+		// exit @ 0x18: ret
+		{Address: 0x18, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x100 {
+			return "step", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"n"}, resolver, nil)
+
+	var do *ir.DoWhileStmt
+	var haveReturn bool
+	for _, s := range stmts {
+		switch v := s.(type) {
+		case *ir.DoWhileStmt:
+			do = v
+		case *ir.ReturnStmt:
+			haveReturn = true
+		}
+	}
+	if do == nil {
+		t.Fatalf("expected a DoWhileStmt among the top-level statements, got %v", stmts)
+	}
+	if !haveReturn {
+		t.Errorf("expected a ReturnStmt (the loop's exit continuation) among the top-level statements, got %v", stmts)
+	}
+
+	// cond should be the branch-taken condition as-is (no negation):
+	// the back-edge IS the branch-taken arm, so "taken" directly means
+	// "keep looping" - see buildDoWhileLoop's own doc comment.
+	cmp, ok := do.Cond.(*ir.BinaryExpr)
+	if !ok || cmp.Op != "<" {
+		t.Fatalf("expected cond to be a \"<\" comparison, got %#v", do.Cond)
+	}
+
+	if do.Body == nil || len(do.Body.Statements) != 1 {
+		t.Fatalf("expected exactly 1 statement in the loop body, got %v", do.Body)
+	}
+	exprStmt2, ok := do.Body.Statements[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the loop body's single statement to be an ExprStmt (the flushed step() call), got %T: %v", do.Body.Statements[0], do.Body.Statements[0])
+	}
+	if call, ok := exprStmt2.Expr.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected the flushed statement to be a call to \"step\", got %#v", exprStmt2.Expr)
+	}
+}
+
+// TestLiftFunction_DoWhileLoopMultiBlockBody is the same source shape
+// as TestLiftFunction_DoWhileLoop, but with the body split across two
+// basic blocks via an internal unconditional "b" (still straight-line -
+// no real branching - but enough to force buildCFG to split it, so
+// this exercises tryLiftDoWhileLoop's forward chain-walk rather than
+// its single-block special case).
+func TestLiftFunction_DoWhileLoopMultiBlockBody(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// mov w2, #0
+		{Address: 0x0, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		// mov w1, w0             (save n into w1 - see
+		// TestLiftFunction_DoWhileLoop's own note on why w0 can't be
+		// used directly once the body calls into anything)
+		{Address: 0x4, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandReg, Reg: "w0"},
+		}},
+		// head @ 0x8: bl step(0x100)
+		{Address: 0x8, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// mov w0, #0             (step()'s result is unused and w0 gets
+		// reassigned before the next call - otherwise other() below
+		// would appear to take step()'s leftover return value as its own
+		// argument, an unrelated existing heuristic limitation - see
+		// buildCall's own doc comment - this test isn't trying to
+		// exercise)
+		{Address: 0xc, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		// b 0x18   (forces a block split here, still straight-line)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// @ 0x18: bl other(0x104)
+		{Address: 0x18, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		// add w2, w2, #1
+		{Address: 0x1c, Size: 4, Mnemonic: "add", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 1},
+		}},
+		// cmp w2, w1
+		{Address: 0x20, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandReg, Reg: "w1"},
+		}},
+		// tail @ 0x24: b.lt head(0x8)
+		{Address: 0x24, Size: 4, Mnemonic: "b.lt", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x8},
+		}},
+		// exit @ 0x28: ret
+		{Address: 0x28, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step", true
+		case 0x104:
+			return "other", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"n"}, resolver, nil)
+
+	var do *ir.DoWhileStmt
+	for _, s := range stmts {
+		if v, ok := s.(*ir.DoWhileStmt); ok {
+			do = v
+		}
+	}
+	if do == nil {
+		t.Fatalf("expected a DoWhileStmt among the top-level statements, got %v", stmts)
+	}
+
+	if do.Body == nil || len(do.Body.Statements) != 2 {
+		t.Fatalf("expected exactly 2 statements in the loop body (step() then other(), from both blocks in the chain), got %v", do.Body)
+	}
+	first, ok := do.Body.Statements[0].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the first body statement to be an ExprStmt, got %T: %v", do.Body.Statements[0], do.Body.Statements[0])
+	}
+	if call, ok := first.Expr.(*ir.StaticMethodCall); !ok || call.Method != "step" {
+		t.Errorf("expected the first call to be \"step\", got %#v", first.Expr)
+	}
+	second, ok := do.Body.Statements[1].(*ir.ExprStmt)
+	if !ok {
+		t.Fatalf("expected the second body statement to be an ExprStmt, got %T: %v", do.Body.Statements[1], do.Body.Statements[1])
+	}
+	if call, ok := second.Expr.(*ir.StaticMethodCall); !ok || call.Method != "other" {
+		t.Errorf("expected the second call to be \"other\", got %#v", second.Expr)
+	}
+}

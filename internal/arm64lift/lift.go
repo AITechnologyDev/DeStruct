@@ -305,6 +305,18 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 	*l.budget--
 	visited[b.StartAddr] = true
 
+	// Must be tried before anything below: a do/for-shaped ("condition
+	// last") loop's body starts running immediately at b, with no
+	// conditional branch of its own to signal "this might be a loop"
+	// until control reaches the TAIL block further down the chain -
+	// by the time an ordinary straight-line walk got there, b (and any
+	// blocks in between) would already be flattened into stmts and
+	// marked visited, too late to retroactively wrap in a loop. See
+	// tryLiftDoWhileLoop's own doc comment.
+	if loopStmts, ok := l.tryLiftDoWhileLoop(b, byAddr, visited, loop); ok {
+		return loopStmts
+	}
+
 	var stmts []ir.Stmt
 
 	if b.LastCond != nil && len(b.Succs) == 2 {
@@ -661,6 +673,121 @@ func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, else
 	bodyStmts = append(bodyStmts, bodyLifter.flushRemaining()...)
 
 	stmts := []ir.Stmt{&ir.WhileStmt{Cond: whileCond, Body: &ir.Block{Statements: bodyStmts}}}
+	if exitBlock, ok := byAddr[exitAddr]; ok {
+		stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited, outerLoop)...)
+	}
+	return stmts, true
+}
+
+// tryLiftDoWhileLoop attempts to recognize b as the entry of a
+// do/for-shaped loop: one compiled with the condition check at the END
+// of the body (real "do { body } while (cond);" source, and some -O0
+// for/while lowerings that reuse this same shape) rather than the
+// front, which tryLiftWhileLoop already handles. This must be tried
+// BEFORE b's own instructions are lifted at all - unlike a while-shape
+// loop, where the head block's conditional branch itself is the signal
+// that something might be a loop, a do-while's body starts running
+// immediately at b with no branch of its own, and the only sign it was
+// a loop all along is a LATER block's back-edge pointing here. By the
+// time an ordinary straight-line walk reached that later block, b (and
+// anything between) would already be flattened into the caller's own
+// stmts and marked visited - too late to retroactively wrap.
+//
+// Scoped narrowly to a straight-line body: walk the chain of blocks
+// starting at b, each with exactly one successor (an ordinary
+// fallthrough or unconditional jump - a real body-internal if/loop
+// would end this walk, see below), until reaching a tail block whose
+// conditional branch has exactly one successor equal to b.StartAddr
+// (the natural repeat) and one that isn't (the exit) - including the
+// zero-length case where b itself both starts the body AND ends it (a
+// single-block do-while with no other blocks in its body at all).
+// Hitting anything else first - an ordinary conditional branch with no
+// back-edge to b, a dead end, or simply never finding such a tail
+// within a bounded number of hops - safely returns ok=false: normal
+// -O0 code has plenty of internal ifs that must NOT be mistaken for
+// "more of the loop body", and this is exactly what stops that (any
+// real conditional branch immediately ends the walk one way or the
+// other). b is then lifted by the ordinary straight-line/if-else path
+// exactly as before this feature existed, identical to how every other
+// loop-shape heuristic in this file falls back when it doesn't
+// recognize a shape.
+//
+// A bounded hop count (not the shared l.budget) is enough here: unlike
+// if/else forking or reachesAddr's BFS, this is a single linear walk
+// with no branching search of its own, so it can never itself cause
+// the exponential blowup l.budget guards against.
+func (l *lifter) tryLiftDoWhileLoop(b *BasicBlock, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, outerLoop *loopCtx) ([]ir.Stmt, bool) {
+	const maxChainLen = 64
+	chain := []*BasicBlock{b}
+	cur := b
+	for i := 0; i < maxChainLen; i++ {
+		if cur.LastCond != nil && len(cur.Succs) == 2 {
+			var exitAddr uint64
+			switch {
+			case cur.Succs[0] == b.StartAddr && cur.Succs[1] != b.StartAddr:
+				exitAddr = cur.Succs[1]
+			case cur.Succs[1] == b.StartAddr && cur.Succs[0] != b.StartAddr:
+				exitAddr = cur.Succs[0]
+			default:
+				// Either an ordinary conditional with no back-edge to b
+				// at all (ends the walk, not a loop), or - vanishingly
+				// unlikely, but not this iteration's problem to solve -
+				// both successors happen to equal b.StartAddr.
+				return nil, false
+			}
+			return l.buildDoWhileLoop(b, cur, chain, exitAddr, byAddr, visited, outerLoop)
+		}
+		if len(cur.Succs) != 1 {
+			// A dead end (ret, unresolved tail call, ...) reached before
+			// any back-edge showed up - not a loop.
+			return nil, false
+		}
+		next, ok := byAddr[cur.Succs[0]]
+		if !ok || visited[next.StartAddr] {
+			return nil, false
+		}
+		chain = append(chain, next)
+		cur = next
+	}
+	return nil, false
+}
+
+// buildDoWhileLoop lifts the straight-line chain from head (inclusive)
+// through tail (inclusive, its own trailing conditional branch aside)
+// as a do-while body, using a freshly forked lifter exactly like
+// tryLiftWhileLoop's body (see its own reasoning: a loop body's
+// register writes are per-iteration state that must not leak into what
+// runs after the loop, which continues from head's OWN pre-loop
+// state). chain is the already-walked block list from
+// tryLiftDoWhileLoop (head..tail inclusive), passed through so this
+// doesn't need to re-derive it.
+func (l *lifter) buildDoWhileLoop(head, tail *BasicBlock, chain []*BasicBlock, exitAddr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, outerLoop *loopCtx) ([]ir.Stmt, bool) {
+	bodyLifter := l.fork()
+
+	var bodyStmts []ir.Stmt
+	for _, blk := range chain[:len(chain)-1] {
+		bodyStmts = append(bodyStmts, bodyLifter.run(blk.Instructions)...)
+	}
+	bodyStmts = append(bodyStmts, bodyLifter.run(tail.Instructions[:len(tail.Instructions)-1])...)
+
+	// As with liftCondition's own doc comment: lift the condition
+	// before flushing, since a cbz/cbnz/tbz/tbnz's tested register is
+	// only ever consumed here, and that consumption must land before
+	// flushRemaining runs.
+	cond := bodyLifter.liftCondition(*tail.LastCond)
+	bodyStmts = append(bodyStmts, bodyLifter.flushRemaining()...)
+
+	// liftCondition lifts the condition for entering Succs[0] (branch
+	// taken) as-is - see its own doc comment. If the back-edge to
+	// head.StartAddr is instead on Succs[1] (the branch-NOT-taken/
+	// fallthrough arm), the real "while (cond)" condition (true means
+	// keep looping) is cond's negation.
+	whileCond := cond
+	if tail.Succs[1] == head.StartAddr {
+		whileCond = &ir.UnaryExpr{Op: "!", Expr: cond}
+	}
+
+	stmts := []ir.Stmt{&ir.DoWhileStmt{Cond: whileCond, Body: &ir.Block{Statements: bodyStmts}}}
 	if exitBlock, ok := byAddr[exitAddr]; ok {
 		stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited, outerLoop)...)
 	}
@@ -1812,24 +1939,30 @@ func (l *lifter) liftRet() ir.Stmt {
 // own nested if/else, break/continue, or nested loops, compound "&&"
 // conditions (these fall out of the nested-body handling for free -
 // see tryLiftWhileLoop's own doc comment) and one-link "||" conditions
-// (tryOrChainLink), and more ALU/shift ops (sub/and/orr/eor/mul/lsl/
-// lsr/asr) are now handled (see liftCall/liftMov/flushRemaining,
-// liftAddr/buildCall's StringResolver use, liftLdr's addrRegs+resolver
-// use with ELFParser.ResolveGOT, tryLiftWhileLoop/reachesAddr/
-// liftLoopEdge, and liftALU). Remaining growth areas, roughly in order
-// of how often real-world -O0 code needs them:
+// (tryOrChainLink), more ALU/shift ops (sub/and/orr/eor/mul/lsl/lsr/
+// asr), and do/for-shaped ("condition last") loops - a straight-line
+// body only, see tryLiftDoWhileLoop's own scope note - are now handled
+// (see liftCall/liftMov/flushRemaining, liftAddr/buildCall's
+// StringResolver use, liftLdr's addrRegs+resolver use with
+// ELFParser.ResolveGOT, tryLiftWhileLoop/reachesAddr/liftLoopEdge,
+// liftALU, and tryLiftDoWhileLoop/buildDoWhileLoop). Remaining growth
+// areas, roughly in order of how often real-world -O0 code needs them:
 //   - A 3+-deep "||" chain ("a || b || c") - tryOrChainLink
 //     deliberately only ever resolves one extra link (see its own doc
 //     comment for why: avoiding partial side effects from a failed
 //     speculative deeper attempt on the shared, unforked lifter).
 //     Falls back to ordinary (still lossless) if/else, same as any
 //     other unrecognized shape.
-//   - do/for-shaped back-edges where the condition check is the LAST
-//     block of the body rather than the first (this iteration only
-//     recognizes the condition-first "while" shape - reachesAddr asks
-//     "does the head's OWN successor loop back to the head", which a
-//     do-while's back-edge, pointing at the body's start rather than
-//     the tail condition's own address, doesn't match).
+//   - A do/for-shaped loop whose body itself contains internal control
+//     flow (an if, or a nested loop) rather than being pure
+//     straight-line code - tryLiftDoWhileLoop's forward chain-walk
+//     deliberately stops at the first real conditional branch it
+//     meets, so this falls back to ordinary (still lossless) nested
+//     if/else, same as any other unrecognized shape - see its own doc
+//     comment for why (distinguishing "one more block of body" from
+//     "the loop's own tail" without first knowing which one it is
+//     would need the same kind of speculative-recursion machinery
+//     tryOrChainLink's own doc comment already declines to add).
 //   - Non-parameter stack locals (regular local variables, not just
 //     spilled parameters), and loads/stores to non-stack memory (real
 //     pointer dereferences, not just the stack-slot bookkeeping this

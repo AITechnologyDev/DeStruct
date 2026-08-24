@@ -51,6 +51,8 @@ func CloneStmt(s Stmt) Stmt {
 		return &IfStmt{Cond: CloneExpr(v.Cond), Then: CloneBlock(v.Then), Else: CloneBlock(v.Else)}
 	case *WhileStmt:
 		return &WhileStmt{Cond: CloneExpr(v.Cond), Body: CloneBlock(v.Body)}
+	case *DoWhileStmt:
+		return &DoWhileStmt{Cond: CloneExpr(v.Cond), Body: CloneBlock(v.Body)}
 	case *ForStmt:
 		return &ForStmt{Init: CloneStmt(v.Init), Cond: CloneExpr(v.Cond), Post: CloneStmt(v.Post), Body: CloneBlock(v.Body)}
 	case *SwitchStmt:
