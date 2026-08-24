@@ -175,24 +175,46 @@ func isConditionalBranch(inst native.DetailedInstruction) bool {
 // ("", false) for an address with no known name.
 type SymbolResolver func(addr uint64) (name string, ok bool)
 
+// StringResolver resolves an absolute data address to the string
+// literal stored there, if any - see internal/native's
+// ELFParser.ReadCString for the real source callers use to build one
+// of these. Returns ("", false) for an address that isn't a
+// recognized NUL-terminated printable string (not in a data section,
+// unterminated, or not text - most likely because it's some other kind
+// of data, e.g. a pointer or vtable, not a string literal). May be
+// nil, in which case an adrp/adr-computed address is only ever
+// rendered as its raw numeric value.
+type StringResolver func(addr uint64) (s string, ok bool)
+
 // LiftFunction lifts a single function's worth of disassembled
 // instructions into IR statements. See the type's own doc comment for
 // paramNames; resolver may be nil, in which case call targets are
-// rendered as bare "func_<address>" placeholders.
-func LiftFunction(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver) []ir.Stmt {
+// rendered as bare "func_<address>" placeholders; strResolver may be
+// nil, in which case a computed data address is rendered as a raw
+// number rather than resolved text.
+func LiftFunction(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver) []ir.Stmt {
 	l := &lifter{
 		regs:     make(map[string]ir.Expr),
 		stack:    make(map[int32]string),
 		params:   paramNames,
 		resolver: resolver,
+		strings:  strResolver,
+		addrRegs: make(map[string]uint64),
+		consumed: make(map[ir.Expr]bool),
 	}
 	l.seedParams()
 
 	blocks := buildCFG(instructions)
 	if len(blocks) <= 1 {
 		// No branching at all - the original straight-line path handles
-		// this case exactly as before CFG support was added.
-		return l.run(instructions)
+		// this case exactly as before CFG support was added. This is
+		// also unconditionally a leaf (nothing follows), so any call
+		// this straight-line run produced but never used - most
+		// commonly a trailing tail call (see liftTailCall) or a
+		// mid-function void call - must be flushed as its own statement
+		// now, or it would just vanish.
+		stmts := l.run(instructions)
+		return append(stmts, l.flushRemaining()...)
 	}
 
 	byAddr := make(map[uint64]*BasicBlock, len(blocks))
@@ -231,6 +253,17 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 		bodyInsns := b.Instructions[:len(b.Instructions)-1]
 		stmts = append(stmts, l.run(bodyInsns)...)
 
+		// The branch condition itself only ever reads l.lastCmp (already
+		// marked consumed by liftCmp, as part of running bodyInsns
+		// above) - anything else this straight-line prefix produced but
+		// left unconsumed can never be reached by name from inside
+		// EITHER fork below (each gets its own copy of consumed from
+		// this point on - see fork's own doc comment), so it must be
+		// flushed here, once, in the parent, before the split - not
+		// left for one or both forks to (incorrectly, redundantly)
+		// flush independently.
+		stmts = append(stmts, l.flushRemaining()...)
+
 		cond := l.liftCondition(*b.LastCond)
 
 		thenAddr, elseAddr := b.Succs[0], b.Succs[1]
@@ -266,10 +299,16 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 	stmts = append(stmts, l.run(b.Instructions)...)
 	if len(b.Succs) == 1 {
 		if next, ok := byAddr[b.Succs[0]]; ok {
-			stmts = append(stmts, l.liftBlockGraph(next, byAddr, visited)...)
+			return append(stmts, l.liftBlockGraph(next, byAddr, visited)...)
 		}
 	}
-	return stmts
+	// A true leaf: either this block has no successor at all, or its
+	// one successor address isn't a block we know how to lift (e.g. an
+	// external tail-call target already handled by liftTailCall as part
+	// of running b.Instructions above). Nothing downstream will ever
+	// read whatever this path's straight-line run left sitting unused
+	// in a register, so flush it now.
+	return append(stmts, l.flushRemaining()...)
 }
 
 // fork returns a new lifter that inherits this lifter's current
@@ -301,7 +340,17 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.stack {
 		stack[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver}
+	calls := make([]ir.Expr, len(l.calls))
+	copy(calls, l.calls)
+	consumed := make(map[ir.Expr]bool, len(l.consumed))
+	for k, v := range l.consumed {
+		consumed[k] = v
+	}
+	addrRegs := make(map[string]uint64, len(l.addrRegs))
+	for k, v := range l.addrRegs {
+		addrRegs[k] = v
+	}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed}
 }
 
 // liftCondition lifts a b.cond instruction into the IR condition
@@ -390,6 +439,43 @@ type lifter struct {
 	// resolver resolves a call target address to a human-readable name,
 	// as given to LiftFunction. May be nil.
 	resolver SymbolResolver
+
+	// strings resolves a data address to the string literal stored
+	// there, as given to LiftFunction. May be nil.
+	strings StringResolver
+
+	// addrRegs maps a register name to the absolute address it's known
+	// to hold as of the most recently lifted instruction - populated by
+	// adrp/adr (a fresh page/byte-precise address) and propagated by a
+	// following "add Rd, Rn, #imm" (the adrp-page + add-offset idiom
+	// AArch64 -O0 code always uses to reach a specific symbol within an
+	// adrp's page). This is tracked SEPARATELY from regs (which holds
+	// the ordinary IR expression for the register, e.g. a placeholder
+	// IntLit of the same address) because the address only becomes
+	// interesting - worth trying to resolve to a string literal via
+	// strings - at the point a register holding one is actually used
+	// (currently: as a call argument, in buildCall) rather than at the
+	// point it's computed, since adrp/adr/add are also used for
+	// perfectly ordinary integer arithmetic this lifter has no way to
+	// distinguish from address computation up front.
+	addrRegs map[string]uint64
+
+	// calls holds every call expression this lifter (or an ancestor it
+	// was forked from) has produced, in creation order - the ordered
+	// half of the "was this call's result ever actually used" tracking
+	// that flushRemaining and the inline orphan-detection in setReg/
+	// clobberReg rely on to emit a void call as its own statement rather
+	// than silently dropping it.
+	calls []ir.Expr
+
+	// consumed marks which entries in calls (by expression identity -
+	// these are always the same *ir.MethodCall/*ir.StaticMethodCall
+	// pointer stored in calls and in regs, never a copy) have been read
+	// by something that embeds them into a larger expression (a call's
+	// own argument, a cmp/add operand, a return value) or already
+	// flushed as their own statement - either way, "already accounted
+	// for" and exempt from being flushed again.
+	consumed map[ir.Expr]bool
 }
 
 // cmpOperands is the lhs/rhs of a lifted "cmp" instruction, in the
@@ -476,7 +562,9 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 				// reasoning as the sub case above.
 				continue
 			}
-			l.liftAdd(inst)
+			stmts = append(stmts, l.liftAdd(inst)...)
+		case "adrp", "adr":
+			stmts = append(stmts, l.liftAddr(inst)...)
 		case "stp":
 			// "stp x29, x30, [sp, #-N]!" is the standard -O0
 			// frame-pointer prologue (saving the caller's frame
@@ -498,12 +586,13 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 		case "mov":
 			// "mov x29, sp" (establishing the frame pointer, standard
 			// -O0 prologue) has no source-level meaning of its own -
-			// recognized and skipped. Any other "mov" shape falls
-			// through unlifted for now; see the TODO at the bottom of
-			// this file.
+			// recognized and skipped. Any other "mov" shape is a
+			// genuine register-to-register or register-immediate move;
+			// see liftMov.
 			if isFramePointerEstablish(inst) {
 				continue
 			}
+			stmts = append(stmts, l.liftMov(inst)...)
 		case "str":
 			l.liftStr(inst)
 		case "ldr":
@@ -511,11 +600,19 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 		case "cmp":
 			l.liftCmp(inst)
 		case "bl":
-			l.liftCall(inst)
+			stmts = append(stmts, l.liftCall(inst)...)
 		case "cset":
-			l.liftCset(inst)
+			stmts = append(stmts, l.liftCset(inst)...)
 		case "ret":
 			stmts = append(stmts, l.liftRet())
+		case "b":
+			// An unconditional "b" reaching run() at all (rather than
+			// ending a block that buildCFG turned into an if/else or a
+			// followed successor edge) is this block's own last
+			// instruction with nowhere internal left to go - see
+			// liftTailCall's own doc comment for why it's only lifted
+			// when its target resolves to a known symbol.
+			stmts = append(stmts, l.liftTailCall(inst)...)
 		}
 	}
 
@@ -654,44 +751,103 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) {
 // bare arithmetic result with nothing done with it isn't source-level
 // meaningful on its own; it becomes a statement once something (a
 // return, a store, ...) actually consumes it.
-func (l *lifter) liftAdd(inst native.DetailedInstruction) {
+func (l *lifter) liftAdd(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 3 {
-		return
+		return nil
 	}
 	dstOp, lhsOp, rhsOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
-	if dstOp.Type != native.OperandReg || lhsOp.Type != native.OperandReg || rhsOp.Type != native.OperandReg {
-		return
+	if dstOp.Type != native.OperandReg || lhsOp.Type != native.OperandReg {
+		return nil
 	}
 
-	lhs := l.regValue(lhsOp.Reg)
-	rhs := l.regValue(rhsOp.Reg)
-	l.regs[dstOp.Reg] = &ir.BinaryExpr{Op: "+", Left: lhs, Right: rhs}
+	switch rhsOp.Type {
+	case native.OperandReg:
+		lhs := l.regValue(lhsOp.Reg)
+		rhs := l.regValue(rhsOp.Reg)
+		l.consume(lhs)
+		l.consume(rhs)
+		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: "+", Left: lhs, Right: rhs})
+	case native.OperandImm:
+		// "add Rd, Rn, #imm" - the standard -O0 second half of the
+		// adrp+add idiom for reaching an exact symbol within an adrp's
+		// page (see liftAddr), but also just ordinary immediate
+		// arithmetic when Rn isn't a known address - propagate addrRegs
+		// in the former case, alongside lifting the arithmetic either
+		// way (nothing here can tell which this is until/unless the
+		// result later gets used as a call argument - see buildCall).
+		lhs := l.regValue(lhsOp.Reg)
+		l.consume(lhs)
+		base, isAddr := l.addrRegs[lhsOp.Reg]
+		stmts := l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: "+", Left: lhs, Right: &ir.IntLit{Value: rhsOp.Imm}})
+		if isAddr {
+			l.addrRegs[dstOp.Reg] = base + uint64(rhsOp.Imm)
+		}
+		return stmts
+	default:
+		return nil
+	}
 }
 
-// liftCall lifts "bl <addr>" - a direct function call. The target
-// address is resolved to a readable name via l.resolver if one was
-// given to LiftFunction (falling back to a "func_<address>" placeholder
-// otherwise), and the call expression is recorded as the new value of
-// w0/x0 (AAPCS64's return-value register) - not emitted as a statement
-// of its own, mirroring liftAdd's reasoning: the call's result only
-// becomes source-level meaningful once something (a return, a
-// comparison, ...) actually consumes it. A call whose result is never
-// used (a real void call, or one made purely for side effects) is not
-// yet handled - see the TODO at the bottom of this file; it would need
-// to be emitted as its own ExprStmt when nothing ever reads w0/x0
-// afterward.
-//
-// Argument recovery (reading x0-x7 as the call's own arguments, the way
-// this lifter reads them for the FUNCTION currently being lifted in
-// seedParams) is not implemented yet - the call is lifted as a
-// zero-argument call regardless of what's actually in those registers
-// at the call site. See the TODO at the bottom of this file.
-func (l *lifter) liftCall(inst native.DetailedInstruction) {
-	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandImm {
-		return
+// liftAddr lifts "adrp Xd, #page" and "adr Xd, #addr" - both compute a
+// PC-relative absolute address into Xd (Capstone resolves the
+// encoded, page- or byte-relative immediate to the final absolute
+// address already, the same way it does for branch targets - see
+// branchTarget's own note); adrp's is page-aligned and typically needs
+// a following "add Xd, Xd, #imm" to reach an exact symbol (see
+// liftAdd's immediate case), while adr's is already byte-precise on
+// its own. Recorded in addrRegs (see its own doc comment) for later
+// resolution to a string literal when the register is actually used;
+// also given an ordinary IntLit placeholder in regs so a use this
+// lifter doesn't (yet) resolve to a string still degrades to a
+// plausible numeric address rather than an unrelated stale value.
+func (l *lifter) liftAddr(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandImm {
+		return nil
 	}
-	target := uint64(inst.Operands[0].Imm)
+	dst, imm := inst.Operands[0], inst.Operands[1]
+	stmts := l.setReg(dst.Reg, &ir.IntLit{Value: imm.Imm})
+	l.addrRegs[dst.Reg] = uint64(imm.Imm)
+	return stmts
+}
 
+// liftMov lifts "mov Rd, Rn" (register-to-register) and "mov Rd, #imm"
+// (register-immediate) - the two shapes real -O0 code uses constantly
+// to shuttle values into the callee-saved registers (x19-x28) that
+// survive across calls, since AAPCS64 lets a callee clobber x0-x18
+// freely. A register-to-register move does NOT count as consuming its
+// source: it's a rename, not a use, so the value must remain just as
+// flushable/embeddable under its new name as it was under the old one
+// (see isOrphanCandidate's own reachable-under-another-name check).
+func (l *lifter) liftMov(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg {
+		return nil
+	}
+	dst, src := inst.Operands[0], inst.Operands[1]
+	switch src.Type {
+	case native.OperandReg:
+		return l.setReg(dst.Reg, l.regValue(src.Reg))
+	case native.OperandImm:
+		return l.setReg(dst.Reg, &ir.IntLit{Value: src.Imm})
+	default:
+		return nil
+	}
+}
+
+// buildCall resolves target to a readable name via l.resolver (falling
+// back to a "func_<address>" placeholder if resolution fails or there
+// is no resolver) and builds the call expression from whatever's
+// currently sitting in x0-x7, shared by both liftCall ("bl", an
+// ordinary call resolution is optional - an unresolved target still
+// gets a placeholder name) and liftTailCall ("b" used as a tail call,
+// where requireResolved must be true: an unresolved "b" target is far
+// more likely an intra-function loop back-edge this lifter doesn't yet
+// understand than a real call, and misreading one as a call to a
+// nonsense "func_<addr>" placeholder would be actively worse than the
+// current silent skip - see isAnyBranch's own note on "b" ending a
+// block). Returns ok=false when requireResolved is true and resolution
+// failed - the only failure case, since an ordinary unresolved call
+// still produces a usable (if uninformative) placeholder call.
+func (l *lifter) buildCall(target uint64, requireResolved bool) (ir.Expr, bool) {
 	rawName := fmt.Sprintf("func_%x", target)
 	resolved := false
 	if l.resolver != nil {
@@ -699,6 +855,9 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) {
 			rawName = n
 			resolved = true
 		}
+	}
+	if requireResolved && !resolved {
+		return nil, false
 	}
 	name := demangle(rawName)
 
@@ -723,6 +882,21 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) {
 		if !ok {
 			break
 		}
+		// If this register currently holds a known address (from
+		// adrp/adr, possibly via a following add - see addrRegs' own
+		// doc comment) and it resolves to an actual string literal,
+		// render the literal itself rather than the raw computed
+		// address - this is the whole point of tracking addrRegs in
+		// the first place. Falls back to the placeholder numeric value
+		// already in v when the address doesn't resolve (most likely:
+		// it's some other kind of data - a pointer, a vtable - not a
+		// plain C string).
+		if addr, isAddr := l.addrRegs[reg]; isAddr && l.strings != nil {
+			if s, ok := l.strings(addr); ok {
+				v = &ir.StringLit{Value: s}
+			}
+		}
+		l.consume(v)
 		args = append(args, v)
 	}
 
@@ -761,22 +935,74 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) {
 	} else {
 		call = &ir.StaticMethodCall{Method: name, Args: args}
 	}
+	return call, true
+}
 
-	// x0-x7 (and their w-register aliases) are caller-saved per
-	// AAPCS64 - the called function is free to clobber any of them, so
-	// whatever was sitting in them before this call is no longer
-	// trustworthy afterward. Without this, a value left over from some
-	// earlier, unrelated assignment would still look "meaningfully
-	// assigned" to a LATER call's own argument-collection loop above,
-	// wrongly reusing stale arguments (or a previous call's own result)
-	// as if they belonged to this one.
+// finishCall applies a just-built call's effect on the register file:
+// x0-x7 (and their w-register aliases) are caller-saved per AAPCS64 -
+// the called function is free to clobber any of them, so whatever was
+// sitting in them before this call is no longer trustworthy afterward
+// (each clobber flushes it first if it was itself an unconsumed call
+// result - see clobberReg). w0/x0 then become the new call's own
+// result. call is also recorded in l.calls so flushRemaining can still
+// emit it later if nothing ever ends up reading w0/x0.
+func (l *lifter) finishCall(call ir.Expr) []ir.Stmt {
+	var stmts []ir.Stmt
 	for i := range aapcs64IntArgRegs {
-		delete(l.regs, aapcs64IntArgRegs[i])
-		delete(l.regs, aapcs64IntArgRegs32[i])
+		stmts = append(stmts, l.clobberReg(aapcs64IntArgRegs[i])...)
+		stmts = append(stmts, l.clobberReg(aapcs64IntArgRegs32[i])...)
 	}
+	l.calls = append(l.calls, call)
+	stmts = append(stmts, l.setReg("w0", call)...)
+	stmts = append(stmts, l.setReg("x0", call)...)
+	return stmts
+}
 
-	l.regs["w0"] = call
-	l.regs["x0"] = call
+// liftCall lifts "bl <addr>" - a direct function call - into a call
+// expression recorded as the new value of w0/x0 (AAPCS64's
+// return-value register). Not emitted as a statement immediately:
+// mirroring liftAdd's reasoning, the call only becomes its own visible
+// statement once it's clear nothing will ever consume its result as a
+// value - see clobberReg (superseded before anything reads it) and
+// flushRemaining (never read at all before this path ends).
+func (l *lifter) liftCall(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandImm {
+		return nil
+	}
+	target := uint64(inst.Operands[0].Imm)
+	call, ok := l.buildCall(target, false)
+	if !ok {
+		return nil
+	}
+	return l.finishCall(call)
+}
+
+// liftTailCall lifts a plain "b <addr>" as a tail call when its target
+// resolves to a known symbol - the standard -O0 codegen for a
+// function's last action being a call whose result (if any) becomes
+// this function's own return value, via AAPCS64 tail-call convention
+// rather than an explicit "bl"+"ret" pair. Requires a resolved target
+// (see buildCall's own doc comment) so an ordinary intra-function
+// branch (a loop back-edge, say - not yet understood by this lifter)
+// is never misread as a call to a bogus "func_<addr>" placeholder.
+//
+// Unlike liftCall, the resulting call is emitted as its own ExprStmt
+// immediately: by definition nothing in THIS function reads its result
+// afterward (a real "ret" would have been used instead of a bare "b"
+// if something did), so there's no reason to leave it pending for
+// flushRemaining to pick up later.
+func (l *lifter) liftTailCall(inst native.DetailedInstruction) []ir.Stmt {
+	target, ok := branchTarget(inst)
+	if !ok {
+		return nil
+	}
+	call, ok := l.buildCall(target, true)
+	if !ok {
+		return nil
+	}
+	stmts := l.finishCall(call)
+	l.consume(call)
+	return append(stmts, &ir.ExprStmt{Expr: call})
 }
 
 // looksLikeInstanceMethod reports whether a raw (still-mangled) Itanium
@@ -824,9 +1050,9 @@ func demangle(name string) string {
 // condition as a separate structured field or operand; it's embedded in
 // OpStr as plain text (e.g. "w0, eq"), so it's extracted from there
 // directly rather than through inst.Operands.
-func (l *lifter) liftCset(inst native.DetailedInstruction) {
+func (l *lifter) liftCset(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
-		return
+		return nil
 	}
 	dst := inst.Operands[0]
 
@@ -839,10 +1065,107 @@ func (l *lifter) liftCset(inst native.DetailedInstruction) {
 	op := condOpFromMnemonic("b." + condText)
 
 	if l.lastCmp == nil {
-		l.regs[dst.Reg] = &ir.LocalVar{Name: "cond"}
+		return l.setReg(dst.Reg, &ir.LocalVar{Name: "cond"})
+	}
+	return l.setReg(dst.Reg, &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs})
+}
+
+// consume marks e as accounted for - already embedded into some larger
+// expression (a call argument, a comparison operand, a return value) -
+// so flushRemaining and the inline orphan-detection in clobberReg never
+// emit it as its own redundant statement. Safe to call with any Expr,
+// including one that was never a call in the first place (consumed's
+// only reader, isOrphanCandidate, already filters by type).
+func (l *lifter) consume(e ir.Expr) {
+	if e == nil {
 		return
 	}
-	l.regs[dst.Reg] = &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs}
+	l.consumed[e] = true
+}
+
+// isOrphanCandidate reports whether e is a call expression that is
+// about to become truly unreachable: not yet consumed, and not sitting
+// in any OTHER register besides exceptReg (the one currently being
+// overwritten/cleared) - e.g. a value mov'd into a callee-saved
+// register earlier is still reachable under that second name even
+// after its original register gets clobbered, so it must NOT be
+// flushed yet.
+func (l *lifter) isOrphanCandidate(e ir.Expr, exceptReg string) bool {
+	if e == nil || l.consumed[e] {
+		return false
+	}
+	switch e.(type) {
+	case *ir.MethodCall, *ir.StaticMethodCall:
+	default:
+		return false
+	}
+	for reg, v := range l.regs {
+		if reg == exceptReg {
+			continue
+		}
+		if v == e {
+			return false
+		}
+	}
+	return true
+}
+
+// clobberReg removes reg's current value, first flushing it as its own
+// ExprStmt if it's an orphaned call result (see isOrphanCandidate) -
+// the inline half of "a call whose result is never used still needs to
+// appear in the output", covering the common case where a NEW write to
+// the same register (another call's argument setup, another call's own
+// return value, ...) supersedes it before anything reads it. The other
+// half, flushRemaining, covers a call that survives all the way to the
+// end of this lifter's path without ever being overwritten OR read.
+func (l *lifter) clobberReg(reg string) []ir.Stmt {
+	var stmts []ir.Stmt
+	if old, ok := l.regs[reg]; ok && l.isOrphanCandidate(old, reg) {
+		stmts = append(stmts, &ir.ExprStmt{Expr: old})
+		l.consumed[old] = true
+	}
+	delete(l.regs, reg)
+	// Whatever reg is about to hold next, it isn't the address this
+	// entry recorded any more - a caller that DOES know the new value
+	// is (or extends) a known address, e.g. liftAddr or liftAdd's
+	// immediate case propagating through "add Rd, Rn, #imm", re-adds
+	// its own entry immediately after calling setReg/clobberReg.
+	delete(l.addrRegs, reg)
+	return stmts
+}
+
+// setReg is clobberReg followed by installing val as reg's new value -
+// the single entry point every instruction that writes a register
+// should use (instead of assigning l.regs[reg] directly) so an
+// orphaned call sitting there never gets silently overwritten without
+// being flushed first.
+func (l *lifter) setReg(reg string, val ir.Expr) []ir.Stmt {
+	stmts := l.clobberReg(reg)
+	l.regs[reg] = val
+	return stmts
+}
+
+// flushRemaining returns an ExprStmt for every call this lifter (or an
+// ancestor it was forked from) has produced that is still unconsumed,
+// in original creation order - the calls that survived to the true end
+// of this lifter's own control-flow path without ever being read or
+// clobbered (see clobberReg for the complementary case: a call
+// superseded mid-path). Must only be called once a caller has
+// established that this path genuinely has no more instructions ahead
+// of it (see LiftFunction and liftBlockGraph's own callers of this) -
+// calling it at a mid-function segment boundary a later block might
+// still read from would flush values a subsequent read was still going
+// to legitimately consume.
+func (l *lifter) flushRemaining() []ir.Stmt {
+	var stmts []ir.Stmt
+	for _, c := range l.calls {
+		if l.consumed[c] {
+			continue
+		}
+		stmts = append(stmts, &ir.ExprStmt{Expr: c})
+		l.consumed[c] = true
+	}
+	return stmts
 }
 
 // regValue returns the IR expression currently associated with a
@@ -864,10 +1187,13 @@ func (l *lifter) liftCmp(inst native.DetailedInstruction) {
 		return
 	}
 	lhs := l.regValue(lhsOp.Reg)
+	l.consume(lhs)
 
 	switch rhsOp.Type {
 	case native.OperandReg:
-		l.lastCmp = &cmpOperands{lhs: lhs, rhs: l.regValue(rhsOp.Reg)}
+		rhs := l.regValue(rhsOp.Reg)
+		l.consume(rhs)
+		l.lastCmp = &cmpOperands{lhs: lhs, rhs: rhs}
 	case native.OperandImm:
 		l.lastCmp = &cmpOperands{lhs: lhs, rhs: &ir.IntLit{Value: rhsOp.Imm}}
 	}
@@ -894,16 +1220,19 @@ func (l *lifter) liftRet() ir.Stmt {
 			val = v
 		}
 	}
+	l.consume(val)
 	return &ir.ReturnStmt{Value: val}
 }
 
-// TODO(next iterations): this lifter currently only understands the
-// exact instruction shapes needed for "int add(int a, int b) { return a
-// + b; }" at -O0. Real growth areas, roughly in order of how often
-// real-world -O0 code needs them: immediate-operand arithmetic (add Rd,
-// Rn, #imm), more ALU ops (sub/mul/and/orr/eor/...), comparisons and
-// conditional branches (cmp + b.cond -> if/else), calls (bl -> function
-// call expressions), non-parameter stack locals (regular local
-// variables, not just spilled parameters), and loads/stores to
-// non-stack memory (real pointer dereferences, not just the stack-slot
-// bookkeeping this version does).
+// TODO(next iterations): calls, comparisons/if-else, generic mov, and
+// void-call statement emission are now handled (see liftCall/liftMov/
+// flushRemaining and liftBlockGraph). Remaining growth areas, roughly
+// in order of how often real-world -O0 code needs them: adrp/adr and
+// immediate-operand arithmetic (add Rd, Rn, #imm) for computing
+// string-literal/global addresses (needs a memory-reader callback
+// alongside SymbolResolver to actually render the literal), more ALU
+// ops (sub/mul/and/orr/eor/...), loops (while/for - buildCFG only
+// structurally recognizes if/else so far), non-parameter stack locals
+// (regular local variables, not just spilled parameters), and loads/
+// stores to non-stack memory (real pointer dereferences, not just the
+// stack-slot bookkeeping this version does).

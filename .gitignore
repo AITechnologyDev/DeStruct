@@ -30,20 +30,27 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
-<<<<<<< HEAD
 
-#Dirs
+# Decompiler output (default -o target for all `destruct` subcommands
+# - see COMMANDS.md; also removed by `make clean`)
 output/
-test/
-.git/
 
-#Files
-*.dex
-*.jar
-*.class
-*.java
-*.kt
-*test
-destruct
-=======
->>>>>>> 7fe5f18cfd6746ebc5d9819f14d24ba3a1c6a44a
+# Compiled top-level binaries (build products of `make build` / a
+# manual `go build -o <name> ./cmd/...` at the repo root) - not the
+# cmd/*/main.go sources themselves, which are tracked.
+/destruct
+/lifttest
+/lvtest
+
+# test/ holds real sample binaries (.dex/.jar/.so/ELF fixtures) used
+# by the test suite and for manual decompiler validation against known
+# source - tracked despite the generic binary-artifact rules above
+# (*.so, ...), which would otherwise silently exclude them.
+!test/
+!test/**
+
+# ...except a reference source tree's own local CMake build output
+# under test/ (compiler-ABI probes, CMakeCache.txt with absolute local
+# paths) - regenerable build artifacts, not source or a fixture in
+# their own right.
+test/il2cpp_memory_dumper_main/build/

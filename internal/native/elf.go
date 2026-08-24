@@ -364,6 +364,80 @@ func (p *ELFParser) GetSymbolName(sym SymbolEntry) string {
 	return string(p.Data[start : start+uint64(end)])
 }
 
+// maxCStringLen bounds how many bytes ReadCString will scan for a NUL
+// terminator - just a sanity limit against a corrupt/adversarial file
+// claiming a huge section size, not a real string-length limit (a
+// literal this long would be unusual for the log/error-message strings
+// this exists to recover).
+const maxCStringLen = 4096
+
+// ReadCString reads a NUL-terminated string literal stored at absolute
+// virtual address vaddr - the data half of the adrp/adr(+add) address
+// computation idiom arm64lift's string-literal resolution uses (an
+// adrp/adr alone gives an address; this turns that address into the
+// actual text sitting there, the way a real string literal would
+// appear in decompiled source).
+//
+// Deliberately restricted to non-executable PROGBITS sections (real
+// rodata/data, never .text): reading through an address that happens
+// to land in code would just decode raw instruction bytes as if they
+// were text, producing plausible-looking but meaningless garbage
+// rather than a real literal - the isPrintableASCII check catches most
+// such cases anyway, but excluding .text outright removes the failure
+// mode entirely rather than relying on it being merely unlikely.
+// Returns ("", false) if vaddr isn't inside such a section, has no NUL
+// within maxCStringLen bytes, or the bytes before that NUL aren't
+// printable text (most likely: vaddr points at binary data - a
+// pointer, a vtable, a length-prefixed non-C-string - not a plain C
+// string).
+func (p *ELFParser) ReadCString(vaddr uint64) (string, bool) {
+	for _, s := range p.Sections {
+		if s.Type != SHT_PROGBITS || s.Flags&0x4 != 0 {
+			continue
+		}
+		if vaddr < s.Addr || vaddr >= s.Addr+s.Size {
+			continue
+		}
+		fileOff := s.Offset + (vaddr - s.Addr)
+		if fileOff >= uint64(len(p.Data)) {
+			return "", false
+		}
+		limit := s.Offset + s.Size
+		if fileOff+maxCStringLen < limit {
+			limit = fileOff + maxCStringLen
+		}
+		if limit > uint64(len(p.Data)) {
+			limit = uint64(len(p.Data))
+		}
+		data := p.Data[fileOff:limit]
+		nul := bytes.IndexByte(data, 0)
+		if nul < 0 {
+			return "", false
+		}
+		raw := data[:nul]
+		if !isPrintableCString(raw) {
+			return "", false
+		}
+		return string(raw), true
+	}
+	return "", false
+}
+
+// isPrintableCString reports whether b looks like genuine printable
+// text (printable ASCII, plus tab/newline/carriage-return) rather than
+// arbitrary binary data that happened to end in a zero byte.
+func isPrintableCString(b []byte) bool {
+	for _, c := range b {
+		if c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 // GetCodeSections returns all executable sections
 func (p *ELFParser) GetCodeSections() []CodeSection {
 	var sections []CodeSection
