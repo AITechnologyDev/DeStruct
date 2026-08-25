@@ -280,6 +280,73 @@ type tryCatchGroup struct {
 // shared [StartPC, EndPC) try range, and resolves each group's overall
 // end point (where control resumes after the whole try/catch construct).
 // Returns the groups in ascending StartIdx order.
+// tryGroupsByStartCache memoizes getTryGroupsByStart's result for the
+// most recently seen (exceptionTable, instructions) pair. Keyed by
+// each slice's own (pointer, length) identity rather than its VALUES:
+// decompileControlFlow and decompileBlockBody are re-entered many
+// times (up to maxBlockBodyCallsPerMethod for the latter) with the
+// method's own unchanging code.ExceptionTable/DecodeInstructions
+// result threaded straight through as pass-through parameters at most
+// call sites - a pointer+length match there is exactly "this is
+// provably the same slice as last time", safe to reuse without
+// recomputing. A genuinely different slice (decompileTryCatchGroup's
+// filtered tryBodyExceptionTable, a catch handler's deliberate nil,
+// or a switch case body's truncated instructions[:realEnd]) has a
+// different pointer and/or length, so it correctly misses the cache
+// and recomputes instead of risking a stale result for the wrong
+// input. No explicit reset is needed across different decompileCode
+// calls either: each method's instructions/exceptionTable come from a
+// fresh DecodeInstructions/ClassFile parse, so their backing-array
+// pointers can never collide with a previous method's by construction.
+//
+// Added after profiling a real, large real-world method (gv0.class in
+// a test fixture jar - a protobuf/Kotlin-generated accessor with one
+// try/catch and 3744 instructions) taking minutes to decompile:
+// decompileBlockBody was calling collectTryCatchGroups - itself
+// allocating maps and sorting - completely redundantly on every one
+// of its own many thousands of recursive entries, even though its
+// (exceptionTable, instructions) arguments never actually changed
+// across the overwhelming majority of those calls. Confirmed via
+// profiling to be the dominant remaining cost (GC pressure from the
+// resulting allocation churn) even after fixing findInstrIdx's own
+// O(n) scan (see that function's doc comment) - this cache resolves
+// it down to sub-second for the same input.
+var (
+	tryGroupsByStartCacheExcPtr *ExceptionEntry
+	tryGroupsByStartCacheExcLen int
+	tryGroupsByStartCacheInsPtr *Instruction
+	tryGroupsByStartCacheInsLen int
+	tryGroupsByStartCacheResult map[int]tryCatchGroup
+)
+
+func getTryGroupsByStart(exceptionTable []ExceptionEntry, instructions []Instruction) map[int]tryCatchGroup {
+	if len(exceptionTable) == 0 || len(instructions) == 0 {
+		return nil
+	}
+	excPtr, insPtr := &exceptionTable[0], &instructions[0]
+	if excPtr == tryGroupsByStartCacheExcPtr && len(exceptionTable) == tryGroupsByStartCacheExcLen &&
+		insPtr == tryGroupsByStartCacheInsPtr && len(instructions) == tryGroupsByStartCacheInsLen {
+		return tryGroupsByStartCacheResult
+	}
+
+	var m map[int]tryCatchGroup
+	for _, g := range collectTryCatchGroups(exceptionTable, instructions) {
+		if g.StartIdx >= 0 && g.StartIdx < len(instructions) {
+			if m == nil {
+				m = make(map[int]tryCatchGroup)
+			}
+			m[g.StartIdx] = g
+		}
+	}
+
+	tryGroupsByStartCacheExcPtr = excPtr
+	tryGroupsByStartCacheExcLen = len(exceptionTable)
+	tryGroupsByStartCacheInsPtr = insPtr
+	tryGroupsByStartCacheInsLen = len(instructions)
+	tryGroupsByStartCacheResult = m
+	return m
+}
+
 func collectTryCatchGroups(exceptionTable []ExceptionEntry, instructions []Instruction) []tryCatchGroup {
 	type key struct{ start, end uint16 }
 	order := make([]key, 0)
@@ -601,41 +668,29 @@ func decompileTryCatchGroup(cf *ClassFile, g tryCatchGroup, instructions []Instr
 		// handler's close()+goto and the entire inner
 		// addSuppressed/athrow handler are the synthetic mechanism this
 		// match recognized and are deliberately not decompiled at all).
-		var tryBodyExceptionTable []ExceptionEntry
-		if len(exceptionTable) > 0 {
-			selfStartPC := instructions[g.StartIdx].Offset
-			for _, et := range exceptionTable {
-				if int(et.StartPC) != selfStartPC {
-					tryBodyExceptionTable = append(tryBodyExceptionTable, et)
-				}
-			}
-		}
-		tryBody := decompileControlFlow(cf, instructions[g.StartIdx:g.EndIdx], localVars, &exprStack{}, className, boolParams, tryBodyExceptionTable)
+		//
+		// Passes the SAME, unmodified exceptionTable the enclosing
+		// method already has (rather than a filtered copy with this
+		// group's own entries removed) - see decompileControlFlowExcl's
+		// own doc comment for why: getTryGroupsByStart's cache is keyed
+		// by slice identity, and this group's own entry (which would
+		// otherwise be rediscovered infinitely - see the excludeSelfStart
+		// parameter below) is instead excluded via a cheap O(1) index
+		// check, not a fresh O(n) filtered allocation.
+		tryBody := decompileControlFlowExcl(cf, instructions[g.StartIdx:g.EndIdx], localVars, &exprStack{}, className, boolParams, exceptionTable, true)
 		return []ir.Stmt{&ir.TryStmt{
 			Resources: []*ir.ResourceDecl{{VarType: resourceType, VarName: resourceName, Init: resourceInit}},
 			Body:      &ir.Block{Statements: tryBody},
 		}}, realBodyEnd
 	}
 
-	// Exclude this group's own exception table entries (matched by
-	// StartPC) before recursing into the try body - the recursive
-	// decompileControlFlow call below runs on a truncated slice
-	// (instructions[g.StartIdx:g.EndIdx]) whose first instruction can
-	// coincidentally land on this same group's own StartPC (offsets are
-	// absolute, unaffected by the slice truncation), which would
-	// otherwise make decompileControlFlow find this exact group again
-	// and call decompileTryCatchGroup on it again - infinitely, since
-	// the truncated slice never changes between recursive calls.
-	var tryBodyExceptionTable []ExceptionEntry
-	if len(exceptionTable) > 0 {
-		selfStartPC := instructions[g.StartIdx].Offset
-		for _, et := range exceptionTable {
-			if int(et.StartPC) != selfStartPC {
-				tryBodyExceptionTable = append(tryBodyExceptionTable, et)
-			}
-		}
-	}
-	tryBody := decompileControlFlow(cf, instructions[g.StartIdx:g.EndIdx], localVars, &exprStack{}, className, boolParams, tryBodyExceptionTable)
+	// excludeSelfStart=true below prevents this exact group from being
+	// rediscovered and reprocessed infinitely: the recursive call runs
+	// on a truncated slice (instructions[g.StartIdx:g.EndIdx]) whose
+	// own local pc 0 always equals this group's own StartIdx (offsets
+	// are absolute, unaffected by the slice truncation) - see
+	// decompileControlFlowExcl's own doc comment.
+	tryBody := decompileControlFlowExcl(cf, instructions[g.StartIdx:g.EndIdx], localVars, &exprStack{}, className, boolParams, exceptionTable, true)
 
 	catches := make([]*ir.CatchClause, 0, len(g.Handlers))
 	for _, h := range g.Handlers {
@@ -1027,6 +1082,25 @@ func buildBoolLocalsSet(cf *ClassFile, methodIdx int) map[uint16]bool {
 }
 
 func decompileControlFlow(cf *ClassFile, instructions []Instruction, localVars map[uint16]string, stack *exprStack, className string, boolParams *boolTypeInfo, exceptionTable []ExceptionEntry) []ir.Stmt {
+	return decompileControlFlowExcl(cf, instructions, localVars, stack, className, boolParams, exceptionTable, false)
+}
+
+// decompileControlFlowExcl is decompileControlFlow with one extra
+// option: excludeSelfStart, set only by decompileTryCatchGroup's own
+// two recursive calls for a try body's own content
+// (instructions[g.StartIdx:g.EndIdx], where local pc 0 always equals
+// g.StartIdx globally - see decompileTryCatchGroup's own doc comment
+// on why that group must not be rediscovered and reprocessed here).
+// Skipping just local pc 0 lets those two call sites pass the SAME,
+// unmodified exceptionTable slice the enclosing method already has
+// (instead of allocating a filtered copy with that one entry removed)
+// so getTryGroupsByStart's pointer-identity cache actually applies -
+// see that cache's own doc comment for why the previous filtered-copy
+// approach defeated it on every single call, and profiling that
+// pinned down as the dominant cost of a real, pathological real-world
+// method (gv0.class in a test fixture jar, 750 independent try/catch
+// groups in one method) that used to take minutes.
+func decompileControlFlowExcl(cf *ClassFile, instructions []Instruction, localVars map[uint16]string, stack *exprStack, className string, boolParams *boolTypeInfo, exceptionTable []ExceptionEntry, excludeSelfStart bool) []ir.Stmt {
 	var result []ir.Stmt
 
 	pc := 0
@@ -1040,17 +1114,7 @@ func decompileControlFlow(cf *ClassFile, instructions []Instruction, localVars m
 	// (top-level only, and unconditionally reprocessing the WHOLE
 	// exception table regardless of what decompileBlockBody already
 	// handled) did.
-	var tryGroupsByStart map[int]tryCatchGroup
-	if len(exceptionTable) > 0 {
-		for _, g := range collectTryCatchGroups(exceptionTable, instructions) {
-			if g.StartIdx >= 0 && g.StartIdx < len(instructions) {
-				if tryGroupsByStart == nil {
-					tryGroupsByStart = make(map[int]tryCatchGroup)
-				}
-				tryGroupsByStart[g.StartIdx] = g
-			}
-		}
-	}
+	tryGroupsByStart := getTryGroupsByStart(exceptionTable, instructions)
 
 	// advance moves pc to newPc if it actually makes forward progress,
 	// and returns whether it did. Several of the pattern-matchers below
@@ -1072,7 +1136,7 @@ func decompileControlFlow(cf *ClassFile, instructions []Instruction, localVars m
 	}
 
 	for pc < len(instructions) {
-		if g, ok := tryGroupsByStart[pc]; ok && g.BodyEndIdx > pc {
+		if g, ok := tryGroupsByStart[pc]; ok && g.BodyEndIdx > pc && !(excludeSelfStart && pc == 0) {
 			tcStmts, newBodyEnd := decompileTryCatchGroup(cf, g, instructions, localVars, className, boolParams, exceptionTable)
 			result = append(result, tcStmts...)
 			pc = newBodyEnd
@@ -1687,13 +1751,13 @@ func decompileBlockBody(cf *ClassFile, instructions []Instruction, start, end in
 	// all, and its astore/exception-handling instructions were
 	// decompiled as if they were ordinary code.
 	var tryGroupsByStart map[int]tryCatchGroup
-	if len(exceptionTable) > 0 {
-		for _, g := range collectTryCatchGroups(exceptionTable, instructions) {
-			if g.StartIdx >= start && g.StartIdx < end {
+	if all := getTryGroupsByStart(exceptionTable, instructions); len(all) > 0 {
+		for idx, g := range all {
+			if idx >= start && idx < end {
 				if tryGroupsByStart == nil {
 					tryGroupsByStart = make(map[int]tryCatchGroup)
 				}
-				tryGroupsByStart[g.StartIdx] = g
+				tryGroupsByStart[idx] = g
 			}
 		}
 	}
@@ -2522,19 +2586,39 @@ func branchOffset(inst Instruction) int {
 }
 
 func findInstrAt(instructions []Instruction, offset int) *Instruction {
-	for i := range instructions {
-		if instructions[i].Offset == offset {
-			return &instructions[i]
-		}
+	i := findInstrIdx(instructions, offset)
+	if i < len(instructions) {
+		return &instructions[i]
 	}
 	return nil
 }
 
+// findInstrIdx locates the instruction starting at the given bytecode
+// offset via binary search - safe because DecodeInstructions always
+// produces instructions in strictly increasing Offset order (a single
+// sequential forward walk over the code array). Returns
+// len(instructions) if no instruction starts exactly there, matching
+// the original linear-scan behavior this replaced.
+//
+// This one function is on the hot path for real, large real-world
+// methods: it's called (directly, or via findInstrAt above) from
+// roughly 50 sites across this file, several inside loops
+// (collectTryCatchGroups, matchTryWithResources) that themselves run
+// on nearly every one of the up to maxBlockBodyCallsPerMethod
+// recursive decompileBlockBody entries. A linear O(n) scan there
+// multiplies out to O(callCount * n) - confirmed via CPU profiling to
+// be the actual cause of a real-world 3744-instruction method (a
+// protobuf/Kotlin-generated accessor, gv0.class in a test fixture
+// jar) taking minutes instead of the sub-second this binary-search
+// version produces for the exact same input. The
+// maxBlockBodyCallsPerMethod budget bounds call COUNT, not per-call
+// cost, so it couldn't have masked this on its own.
 func findInstrIdx(instructions []Instruction, offset int) int {
-	for i, inst := range instructions {
-		if inst.Offset == offset {
-			return i
-		}
+	i := sort.Search(len(instructions), func(i int) bool {
+		return instructions[i].Offset >= offset
+	})
+	if i < len(instructions) && instructions[i].Offset == offset {
+		return i
 	}
 	return len(instructions)
 }

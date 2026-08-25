@@ -2,6 +2,7 @@ package jvm
 
 import (
 	"testing"
+	"time"
 
 	"github.com/destruct/destruct/internal/ir"
 )
@@ -122,5 +123,45 @@ func TestDecompileClassFile_AstoreLocalGetsDeclared(t *testing.T) {
 	}
 	if class_.Name != "java.io.ByteArrayOutputStream" {
 		t.Errorf("expected the inferred type to be java.io.ByteArrayOutputStream (the invokespecial <init> target's own class, NOT its void descriptor return type), got %q", class_.Name)
+	}
+}
+
+// TestDecompileClassFile_ManyTryCatchBlocksStaysFast covers a real
+// performance bug: a real-world obfuscated class (gv0.class in
+// test/zenin/classes_merge.jar, NOT checked into this repo - a
+// protobuf/Kotlin-generated accessor with 750 independent try/catch
+// blocks in one method) took minutes - functionally hung - to
+// decompile, because decompileTryCatchGroup rebuilt a freshly
+// filtered COPY of the whole exception table (to exclude its own
+// entry and avoid infinite self-rediscovery) on every one of the many
+// groups, defeating getTryGroupsByStart's pointer-identity cache and
+// making every group's own lookup redo O(exceptionTable) work -
+// O(groups^2) overall, compounded by findInstrIdx's own O(n) linear
+// scan before that was fixed to a binary search. Both are fixed now:
+// the self-entry is excluded via a cheap O(1) index check
+// (decompileControlFlowExcl's excludeSelfStart) so the ORIGINAL,
+// cacheable exception table slice is reused across every group.
+//
+// testdata/ManyTryCatch.class (200 independent try/catch blocks in
+// one method, real javac output) exercises the same shape at a scale
+// that still finishes near-instantly with the fix - a generous 10s
+// bound (matching this project's other real-world-validated,
+// non-flaky timing assumptions) comfortably separates "fixed" from
+// "the O(n^2) bug is back", since the unfixed version's timing here
+// was already well past a minute for the (much larger, admittedly)
+// real 750-block case and would be at least noticeably slow even at
+// only 200 blocks.
+func TestDecompileClassFile_ManyTryCatchBlocksStaysFast(t *testing.T) {
+	start := time.Now()
+	prog, err := DecompileClassFile("testdata/ManyTryCatch.class")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("DecompileClassFile: %v", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("expected decompiling 200 independent try/catch blocks to take well under 10s, took %v - likely a regression of the O(n^2) exception-table-recomputation bug", elapsed)
+	}
+	if len(prog.Classes) != 1 || len(prog.Classes[0].Methods) == 0 {
+		t.Fatalf("expected a decompiled class with at least one method, got %#v", prog.Classes)
 	}
 }
