@@ -436,7 +436,7 @@ func (p *Pipeline) decompileELFArm64() error {
 			defer func() {
 				if r := recover(); r != nil {
 					failed++
-					fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", c.name, r)
+					fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
 				}
 			}()
 			stmts := arm64lift.LiftFunction(insns, nil, resolver, strResolver)
@@ -445,7 +445,7 @@ func (p *Pipeline) decompileELFArm64() error {
 			} else {
 				ok++
 			}
-			fmt.Fprintf(f, "// %s\n", c.name)
+			fmt.Fprintf(f, "// %s\n", arm64lift.Demangle(c.name))
 			arm64lift.RenderStmts(f, stmts, 0)
 			fmt.Fprintln(f)
 		}()

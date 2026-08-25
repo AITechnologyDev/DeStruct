@@ -2132,16 +2132,18 @@ func methodNameOnly(name string) string {
 	return name
 }
 
-// demangle strips the Itanium C++ ABI mangling prefix/wrapper down to
-// a bare, readable form for display purposes. This is NOT a real
-// demangler (which would need to parse the full mangling grammar -
-// template arguments, nested namespaces, cv-qualifiers, and so on) -
-// it only recognizes the "_Z" prefix and, when present, falls back to
-// showing the mangled name as-is rather than attempting anything more
-// sophisticated that could render actively wrong output. A real
-// demangler is real, non-trivial future work - see the TODO at the
-// bottom of this file.
+// demangle renders an Itanium C++ ABI mangled symbol ("_Z...") down to
+// its bare, readable qualified name via itaniumDemangle (demangle.go) -
+// e.g. "std::__ndk1::basic_string<char, ...>::find". Falls back to the
+// name unchanged whenever it isn't Itanium-mangled at all, or when
+// itaniumDemangle hits any construct it doesn't recognize - matching
+// this project's existing "never render something silently wrong"
+// philosophy, since a partially-wrong demangling would be worse than
+// the still-legible raw mangled form.
 func demangle(name string) string {
+	if d, ok := itaniumDemangle(name); ok {
+		return d
+	}
 	return name
 }
 

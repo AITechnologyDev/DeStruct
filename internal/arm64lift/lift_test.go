@@ -210,8 +210,8 @@ func TestLiftFunction_LdrThroughGOT(t *testing.T) {
 		t.Fatalf("expected exactly 1 argument, got %v", call.Args)
 	}
 	arg, ok := call.Args[0].(*ir.LocalVar)
-	if !ok || arg.Name != "_ZNSt6__ndk14cerrE" {
-		t.Errorf("expected the argument to be a reference to the resolved GOT name, got %#v", call.Args[0])
+	if !ok || arg.Name != "std::__ndk1::cerr" {
+		t.Errorf("expected the argument to be a reference to the resolved GOT name, demangled (via itaniumDemangle) to its readable form, got %#v", call.Args[0])
 	}
 }
 
