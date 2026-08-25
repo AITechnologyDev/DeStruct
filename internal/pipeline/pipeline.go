@@ -387,9 +387,102 @@ func (p *Pipeline) decompileELFArm64() error {
 	}
 	defer f.Close()
 
-	const sttFunc = 2
+	candidates := functionCandidatesFromSymbols(elf)
+	if len(candidates) == 0 {
+		// No usable function symbol anywhere (neither .symtab nor
+		// .dynsym has one - a stripped EXECUTABLE, most likely, since a
+		// stripped shared library's own exports normally survive in
+		// .dynsym regardless - see ELFParser.SymbolResolver's own doc
+		// comment). Fall back to .eh_frame_hdr's own unwind-table
+		// function boundaries (see ELFParser.DiscoverFunctions' own doc
+		// comment for why that still works even here), naming each one
+		// "sub_<address>" - there's no real name to recover, only
+		// where it starts and how big it is.
+		if discovered, discErr := elf.DiscoverFunctions(); discErr == nil {
+			var discoveredCandidates []funcCandidate
+			discoveredCandidates, resolver = withDiscoveredFunctions(discovered, resolver)
+			candidates = append(candidates, discoveredCandidates...)
+			fmt.Printf("No symbol table found - recovered %d function boundaries from .eh_frame_hdr instead\n", len(candidates))
+		} else {
+			fmt.Printf("warning: no function symbols and no .eh_frame_hdr fallback available (%v) - nothing to decompile\n", discErr)
+		}
+	}
+
 	var ok, empty, failed int
 	lastReport := time.Now()
+	for _, c := range candidates {
+		var sec *native.SectionHeader
+		for j := range elf.Sections {
+			s := &elf.Sections[j]
+			if c.addr >= s.Addr && c.addr < s.Addr+s.Size {
+				sec = s
+				break
+			}
+		}
+		if sec == nil {
+			continue
+		}
+		fileOff := sec.Offset + (c.addr - sec.Addr)
+		if fileOff+c.size > uint64(len(elf.Data)) {
+			continue
+		}
+		code := elf.Data[fileOff : fileOff+c.size]
+		insns, err := d.DisassembleDetailed(code, c.addr)
+		if err != nil || len(insns) == 0 {
+			continue
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					failed++
+					fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", c.name, r)
+				}
+			}()
+			stmts := arm64lift.LiftFunction(insns, nil, resolver, strResolver)
+			if len(stmts) == 0 {
+				empty++
+			} else {
+				ok++
+			}
+			fmt.Fprintf(f, "// %s\n", c.name)
+			arm64lift.RenderStmts(f, stmts, 0)
+			fmt.Fprintln(f)
+		}()
+
+		if p.opts.Verbose {
+			fmt.Printf("  [%d/%d/%d ok/empty/failed] %s\n", ok, empty, failed, c.name)
+		} else if time.Since(lastReport) > time.Second {
+			fmt.Printf("  ... %d functions decompiled\n", ok+empty+failed)
+			lastReport = time.Now()
+		}
+	}
+
+	fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, outPath)
+	return nil
+}
+
+// funcCandidate is one function decompileELFArm64 attempts to lift -
+// either a real, named symbol-table entry, or (see
+// functionCandidatesFromSymbols' own caller) a synthetically-named
+// boundary recovered from .eh_frame_hdr when there's no symbol table
+// at all.
+type funcCandidate struct {
+	addr uint64
+	size uint64
+	name string
+}
+
+// functionCandidatesFromSymbols builds the ordinary, name-bearing
+// candidate list from elf.Symbols (.symtab, or .dynsym when that's all
+// a stripped binary has left - see ELFParser.SymbolResolver's own doc
+// comment) - empty when neither has a single usable (STT_FUNC,
+// non-zero size, non-empty name) entry, which is exactly the signal
+// decompileELFArm64 uses to fall back to .eh_frame_hdr-based discovery
+// instead.
+func functionCandidatesFromSymbols(elf *native.ELFParser) []funcCandidate {
+	const sttFunc = 2
+	var candidates []funcCandidate
 	for i := range elf.Symbols {
 		sym := elf.Symbols[i]
 		if sym.Info&0xf != sttFunc || sym.Size == 0 {
@@ -399,54 +492,39 @@ func (p *Pipeline) decompileELFArm64() error {
 		if name == "" {
 			continue
 		}
-
-		var sec *native.SectionHeader
-		for j := range elf.Sections {
-			s := &elf.Sections[j]
-			if sym.Value >= s.Addr && sym.Value < s.Addr+s.Size {
-				sec = s
-				break
-			}
-		}
-		if sec == nil {
-			continue
-		}
-		fileOff := sec.Offset + (sym.Value - sec.Addr)
-		if fileOff+sym.Size > uint64(len(elf.Data)) {
-			continue
-		}
-		code := elf.Data[fileOff : fileOff+sym.Size]
-		insns, err := d.DisassembleDetailed(code, sym.Value)
-		if err != nil || len(insns) == 0 {
-			continue
-		}
-
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					failed++
-					fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", name, r)
-				}
-			}()
-			stmts := arm64lift.LiftFunction(insns, nil, resolver, strResolver)
-			if len(stmts) == 0 {
-				empty++
-			} else {
-				ok++
-			}
-			fmt.Fprintf(f, "// %s\n", name)
-			arm64lift.RenderStmts(f, stmts, 0)
-			fmt.Fprintln(f)
-		}()
-
-		if p.opts.Verbose {
-			fmt.Printf("  [%d/%d/%d ok/empty/failed] %s\n", ok, empty, failed, name)
-		} else if time.Since(lastReport) > time.Second {
-			fmt.Printf("  ... %d functions decompiled\n", ok+empty+failed)
-			lastReport = time.Now()
-		}
+		candidates = append(candidates, funcCandidate{addr: sym.Value, size: sym.Size, name: name})
 	}
+	return candidates
+}
 
-	fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, outPath)
-	return nil
+// withDiscoveredFunctions builds the candidate list for functions
+// found only through .eh_frame_hdr (see ELFParser.DiscoverFunctions'
+// own doc comment - no real name to recover, only where each one
+// starts and how big it is), named "sub_<address>", and wraps base
+// (the ordinary symbol-based resolver) so a CALL from one of these
+// discovered-but-unnamed functions to another one also resolves to
+// that same "sub_<address>" name instead of falling through to
+// buildCall's own generic "func_<address>" placeholder (see its own
+// doc comment) - two different placeholder spellings for the identical
+// "no real name" situation otherwise, depending only on whether an
+// address is being decompiled as its OWN top-level entry or merely
+// called FROM another one. base is always tried first, so a real
+// symbol (should one somehow exist at the same address as a discovered
+// one) still wins.
+func withDiscoveredFunctions(discovered []native.DiscoveredFunction, base func(uint64) (string, bool)) ([]funcCandidate, func(uint64) (string, bool)) {
+	candidates := make([]funcCandidate, 0, len(discovered))
+	names := make(map[uint64]string, len(discovered))
+	for _, fn := range discovered {
+		name := fmt.Sprintf("sub_%x", fn.Addr)
+		candidates = append(candidates, funcCandidate{addr: fn.Addr, size: fn.Size, name: name})
+		names[fn.Addr] = name
+	}
+	resolver := func(addr uint64) (string, bool) {
+		if name, ok := base(addr); ok {
+			return name, true
+		}
+		name, ok := names[addr]
+		return name, ok
+	}
+	return candidates, resolver
 }
