@@ -73,3 +73,54 @@ func TestDecompileClassFile_SuperAndThisCallArgs(t *testing.T) {
 		t.Errorf("expected the this() arg to be the string literal \"default\", got %#v", thisCall.Args[0])
 	}
 }
+
+// TestDecompileClassFile_AstoreLocalGetsDeclared decompiles a REAL,
+// javac-compiled .class file (testdata/AstoreRetype.class, built
+// WITHOUT -g so it has no LocalVariableTable at all - see that file's
+// own doc comment) exercising the actual bug: collectLocalTypes had no
+// case at all for Astore/Astore_<n> (only the primitive stores), so a
+// reference-typed local with no debug info never got an entry in its
+// types map and was silently omitted from the method's declarations
+// entirely, even though it's used later in the body - "buf" in the
+// real test/lunacy/classes_merge.jar's NPStringFog.decode rendered as
+// an undeclared identifier for exactly this reason.
+func TestDecompileClassFile_AstoreLocalGetsDeclared(t *testing.T) {
+	prog, err := DecompileClassFile("testdata/AstoreRetype.class")
+	if err != nil {
+		t.Fatalf("DecompileClassFile: %v", err)
+	}
+	if len(prog.Classes) != 1 {
+		t.Fatalf("expected exactly 1 class, got %d", len(prog.Classes))
+	}
+	class := prog.Classes[0]
+
+	var build *ir.Method
+	for _, m := range class.Methods {
+		if m.Name == "build" {
+			build = m
+		}
+	}
+	if build == nil {
+		t.Fatalf("expected a \"build\" method among %v", class.Methods)
+	}
+	if build.Body == nil {
+		t.Fatalf("expected \"build\" to have a body")
+	}
+
+	var decl *ir.VarDeclStmt
+	for _, s := range build.Body.Statements {
+		if v, ok := s.(*ir.VarDeclStmt); ok {
+			decl = v
+		}
+	}
+	if decl == nil {
+		t.Fatalf("expected a VarDeclStmt for the undeclared local (\"buf\" in the original source) among %v, got none at all - this is the bug", build.Body.Statements)
+	}
+	class_, ok := decl.Type.(*ir.ClassType)
+	if !ok {
+		t.Fatalf("expected the inferred type to be a ClassType (from the \"new ByteArrayOutputStream(...)\" + invokespecial <init> pattern), got %T: %v", decl.Type, decl.Type)
+	}
+	if class_.Name != "java.io.ByteArrayOutputStream" {
+		t.Errorf("expected the inferred type to be java.io.ByteArrayOutputStream (the invokespecial <init> target's own class, NOT its void descriptor return type), got %q", class_.Name)
+	}
+}

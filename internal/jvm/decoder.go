@@ -255,10 +255,16 @@ func collectLocalTypes(cf *ClassFile, methodIdx int, code *CodeAttribute) map[ui
 	}
 
 	instructions := DecodeInstructions(code.Code)
-	for _, inst := range instructions {
+	for i, inst := range instructions {
 		var localIdx byte
 		var typ ir.Type
 		switch inst.Opcode {
+		case Astore0, Astore1, Astore2, Astore3:
+			localIdx = byte(inst.Opcode - Astore0)
+			typ = inferAstoreType(cf, instructions, i)
+		case Astore:
+			localIdx = inst.Operands[0]
+			typ = inferAstoreType(cf, instructions, i)
 		case Istore0, Istore1, Istore2, Istore3:
 			localIdx = byte(inst.Opcode - Istore0)
 			typ = &ir.PrimitiveType{Name: "int"}
@@ -296,6 +302,110 @@ func collectLocalTypes(cf *ClassFile, methodIdx int, code *CodeAttribute) map[ui
 
 	_ = isStatic
 	return types
+}
+
+// inferAstoreType guesses a declarable Java type for a reference-typed
+// local stored via astore/astore_<n>. Unlike the primitive stores
+// above (whose opcode alone fixes the type), astore's operand stack
+// value could be almost anything, and this project doesn't parse
+// StackMapTable (the JVM's own authoritative per-PC type source) -  so
+// instead this looks at just the ONE instruction immediately before
+// the store, which for ordinary (non-optimized, non-obfuscated)
+// compiler output is by far the most common shape: produce a value,
+// immediately store it. Falls back to Object - always a valid
+// declaration for any reference value - whenever that single
+// instruction isn't one of the handful recognized here, rather than
+// attempt to simulate the operand stack through dup/swap/pop/branches.
+func inferAstoreType(cf *ClassFile, instructions []Instruction, storeAt int) ir.Type {
+	object := &ir.ClassType{Name: "Object"}
+	if storeAt == 0 {
+		return object
+	}
+	prev := instructions[storeAt-1]
+	classIdxOperand := func() (uint16, bool) {
+		if len(prev.Operands) < 2 {
+			return 0, false
+		}
+		return uint16(prev.Operands[0])<<8 | uint16(prev.Operands[1]), true
+	}
+	switch prev.Opcode {
+	case New, Checkcast:
+		if idx, ok := classIdxOperand(); ok {
+			return &ir.ClassType{Name: classNameToJavaName(cf.GetClassName(idx))}
+		}
+	case Anewarray:
+		if idx, ok := classIdxOperand(); ok {
+			return &ir.ArrayType{Elem: &ir.ClassType{Name: classNameToJavaName(cf.GetClassName(idx))}}
+		}
+	case Newarray:
+		if len(prev.Operands) >= 1 {
+			return &ir.ArrayType{Elem: &ir.PrimitiveType{Name: newarrayTypeName(prev.Operands[0])}}
+		}
+	case Invokevirtual, Invokespecial, Invokestatic, Invokeinterface:
+		if idx, ok := classIdxOperand(); ok {
+			className, methodName, desc, resolved := resolveInvokeTarget(cf, idx)
+			if resolved && methodName == "<init>" {
+				// "new Foo(...); dup; ...; invokespecial Foo.<init>" -
+				// the constructor's OWN descriptor return type is void
+				// (constructors never return a value), so the type
+				// that actually ends up on the stack (and gets
+				// astore'd right after) is the constructed class
+				// itself, taken from the invokespecial target rather
+				// than from the descriptor.
+				return &ir.ClassType{Name: classNameToJavaName(className)}
+			}
+			if resolved {
+				if t := invokeReturnType(desc); t != nil {
+					return t
+				}
+			}
+		}
+	}
+	return object
+}
+
+// resolveInvokeTarget resolves the class name, method name, and
+// descriptor of the method referenced by constant pool entry idx.
+func resolveInvokeTarget(cf *ClassFile, idx uint16) (className, methodName, descriptor string, ok bool) {
+	if int(idx) >= len(cf.ConstantPool) {
+		return "", "", "", false
+	}
+	entry := cf.ConstantPool[idx]
+	var natIdx uint16
+	switch entry.Tag {
+	case CPTypeMethodref:
+		if entry.Methodref == nil {
+			return "", "", "", false
+		}
+		className = cf.GetClassName(entry.Methodref.ClassIndex)
+		natIdx = entry.Methodref.NameAndTypeIndex
+	case CPTypeInterfaceMethodref:
+		if entry.InterfaceMethodref == nil {
+			return "", "", "", false
+		}
+		className = cf.GetClassName(entry.InterfaceMethodref.ClassIndex)
+		natIdx = entry.InterfaceMethodref.NameAndTypeIndex
+	default:
+		return "", "", "", false
+	}
+	if int(natIdx) >= len(cf.ConstantPool) || cf.ConstantPool[natIdx].NameAndType == nil {
+		return "", "", "", false
+	}
+	nat := cf.ConstantPool[natIdx].NameAndType
+	return className, cf.GetUTF8(nat.NameIndex), cf.GetUTF8(nat.DescriptorIndex), true
+}
+
+// invokeReturnType parses a method descriptor's return type, returning
+// nil for void/primitive returns (callers fall back to Object in that
+// case - a primitive value being stored via astore would indicate
+// something already unusual).
+func invokeReturnType(descriptor string) ir.Type {
+	_, ret := ParseDescriptor(descriptor)
+	t := jvmParsedToIRType(ret)
+	if _, isPrimitive := t.(*ir.PrimitiveType); isPrimitive {
+		return nil
+	}
+	return t
 }
 
 func descriptorToIRType(desc string) ir.Type {
