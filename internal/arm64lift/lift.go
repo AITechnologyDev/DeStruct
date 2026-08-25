@@ -1267,6 +1267,52 @@ var aapcs64IntArgRegs = []string{"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"}
 // index-for-index with aapcs64IntArgRegs.
 var aapcs64IntArgRegs32 = []string{"w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"}
 
+// knownArity gives the REAL, ABI-fixed integer/pointer argument count
+// for the handful of C/pthread/C++-runtime functions that show up in
+// essentially every real-world AArch64 Android/Linux binary - the same
+// role Ghidra's own built-in libc signature database plays for it.
+// collectCallArgs' general heuristic (grab whatever's currently in
+// x0-x7) has no way to know a callee's true arity at all, so for a
+// genuinely 0-argument function like __stack_chk_fail it was
+// scavenging whatever unrelated, still-unconsumed value happened to be
+// sitting in x0 (almost always some earlier call's discarded return
+// value) and rendering it as a bogus argument - producing nonsense
+// like "__stack_chk_fail(someOtherCall())" instead of two separate
+// statements. Deliberately limited to genuinely fixed-arity functions
+// (no variadics like fprintf/__android_log_print, whose real arg count
+// this lifter has no way to recover either way, so the general
+// heuristic remains the least-bad option there).
+var knownArity = map[string]int{
+	"__stack_chk_fail":          0,
+	"abort":                     0,
+	"__cxa_pure_virtual":        0,
+	"__cxa_deleted_virtual":     0,
+	"pthread_self":              0,
+	"__cxa_guard_acquire":       1,
+	"__cxa_guard_release":       1,
+	"__cxa_guard_abort":         1,
+	"pthread_mutex_lock":        1,
+	"pthread_mutex_unlock":      1,
+	"pthread_mutex_trylock":     1,
+	"pthread_mutex_destroy":     1,
+	"pthread_mutexattr_init":    1,
+	"pthread_mutexattr_destroy": 1,
+	"pthread_cond_signal":       1,
+	"pthread_cond_broadcast":    1,
+	"pthread_cond_destroy":      1,
+	"strlen":                    1,
+	"free":                      1,
+	"fflush":                    1,
+	"pthread_mutex_init":        2,
+	"pthread_mutexattr_settype": 2,
+	"pthread_cond_wait":         2,
+	"pthread_equal":             2,
+	"__cxa_atexit":              3,
+	"memcpy":                    3,
+	"memset":                    3,
+	"memmove":                   3,
+}
+
 // paramNameForReg returns the declared parameter name for a register if
 // it's one of the AAPCS64 integer argument registers within range of
 // the caller-supplied paramNames, and ok=false otherwise (a register
@@ -1829,8 +1875,23 @@ func (l *lifter) liftMov(inst native.DetailedInstruction) []ir.Stmt {
 // overcount or undercount on more unusual codegen. See the TODO at the
 // bottom of this file.
 func (l *lifter) collectCallArgs() []ir.Expr {
+	return l.collectCallArgsN(len(aapcs64IntArgRegs))
+}
+
+// collectCallArgsN is collectCallArgs capped at at most n registers -
+// used when the callee's real arity is actually known (see
+// knownArity), so a genuinely zero/fixed-argument well-known ABI
+// function (__stack_chk_fail, pthread_mutex_lock, ...) can never
+// scavenge an unrelated leftover value out of x0-x7 the way the
+// general heuristic otherwise would. n == len(aapcs64IntArgRegs) (via
+// collectCallArgs) reproduces the original unlimited heuristic
+// exactly.
+func (l *lifter) collectCallArgsN(n int) []ir.Expr {
 	var args []ir.Expr
-	for _, reg := range aapcs64IntArgRegs {
+	for i, reg := range aapcs64IntArgRegs {
+		if i >= n {
+			break
+		}
 		v, ok := l.regs[reg]
 		if !ok {
 			break
@@ -1883,7 +1944,12 @@ func (l *lifter) buildCall(target uint64, requireResolved bool) (ir.Expr, bool) 
 	}
 	name := demangle(rawName)
 
-	args := l.collectCallArgs()
+	var args []ir.Expr
+	if n, known := knownArity[rawName]; known {
+		args = l.collectCallArgsN(n)
+	} else {
+		args = l.collectCallArgs()
+	}
 
 	// A mangled Itanium C++ instance method name (recognized by the
 	// standard "_ZN...E" nested-name pattern, as opposed to a free

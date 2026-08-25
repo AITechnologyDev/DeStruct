@@ -1447,6 +1447,77 @@ func TestLiftFunction_PointerFieldLoadPreservesUnusedCall(t *testing.T) {
 	}
 }
 
+// TestLiftFunction_KnownArityCallDoesNotScavengeLeftoverArg covers the
+// real bug found comparing this project's output against r2ghidra's on
+// test/liblun.so: calling a well-known, genuinely 0-argument function
+// like __stack_chk_fail right after some OTHER call whose result was
+// never used left that leftover value sitting in x0 - and
+// collectCallArgs' general "grab whatever's in x0-x7" heuristic had no
+// way to know __stack_chk_fail takes no arguments at all, so it
+// scavenged the leftover value as a bogus first argument instead of
+// letting it be flushed as its own statement (producing nonsense like
+// "__stack_chk_fail(leftover())"). knownArity fixes this for the
+// handful of fixed-arity libc/pthread/C++-runtime functions common to
+// nearly every real binary.
+func TestLiftFunction_KnownArityCallDoesNotScavengeLeftoverArg(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// bl leftover()  - result lands in x0, never read by anything
+		{Address: 0x0, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// bl __stack_chk_fail()  - real arity 0; x0 still holds
+		// leftover()'s own unconsumed result at this point.
+		{Address: 0x4, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "leftover", true
+		case 0x104:
+			return "__stack_chk_fail", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+
+	haveLeftover := false
+	stackChkArgs := -1
+	for _, s := range stmts {
+		var call *ir.StaticMethodCall
+		switch v := s.(type) {
+		case *ir.ExprStmt:
+			call, _ = v.Expr.(*ir.StaticMethodCall)
+		case *ir.ReturnStmt:
+			// __stack_chk_fail() is the last thing computed before
+			// "ret", so it may flow straight into the return rather
+			// than being flushed as its own ExprStmt (same as
+			// TestLiftFunction_PointerFieldLoadPreservesUnusedCall's
+			// "other()" above) - either way, it appears somewhere.
+			call, _ = v.Value.(*ir.StaticMethodCall)
+		}
+		if call == nil {
+			continue
+		}
+		switch call.Method {
+		case "leftover":
+			haveLeftover = true
+		case "__stack_chk_fail":
+			stackChkArgs = len(call.Args)
+		}
+	}
+	if !haveLeftover {
+		t.Errorf("expected leftover()'s unused result to still be flushed as its own statement, got %v", stmts)
+	}
+	if stackChkArgs != 0 {
+		t.Errorf("expected __stack_chk_fail() to be called with its real, fixed arity of 0 args (not a scavenged leftover value), got %d among %v", stackChkArgs, stmts)
+	}
+}
+
 // TestLiftFunction_CompoundOrConditionThreeDeep lifts a hand-built
 // instruction stream equivalent to:
 //
