@@ -268,7 +268,23 @@ func (p *ELFParser) parseSymbols() error {
 			return p.parseSymbolTable(s)
 		}
 	}
-	return fmt.Errorf("no symbol table found")
+	// No .symtab (a stripped binary - the common case for a real-world
+	// release build) - fall back to .dynsym, which a linker can never
+	// fully strip from a dynamically linked binary, since the dynamic
+	// linker itself needs it at load time to resolve imports/exports.
+	// A stripped SHARED LIBRARY in particular often still has every one
+	// of its exported functions (its real public API surface) listed
+	// here with real addresses and sizes, even with zero private/
+	// internal symbols left - this is what lets an otherwise
+	// symbol-less binary still decompile at all (see
+	// ELFParser.SymbolResolver's own doc comment).
+	dynsyms, dynstrNdx, err := p.parseDynsym()
+	if err != nil {
+		return fmt.Errorf("no symbol table found (checked .symtab and .dynsym): %w", err)
+	}
+	p.Symbols = dynsyms
+	p.SymStrTabNdx = dynstrNdx
+	return nil
 }
 
 func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
